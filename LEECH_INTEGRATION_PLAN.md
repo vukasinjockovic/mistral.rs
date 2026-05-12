@@ -44,7 +44,45 @@ Six phases, all on `leech-quant`. Each phase has a verification gate; no phase s
   4. Reads the manifest JSON and confirms 248 LLVQ + 2 fp8 + 177 bf16 = 427 tensors.
   5. Manifest SHA-256 digests match the file on disk.
 
-### Phase 2 — Universal table codegen ✅ DONE (commit pending)
+### Phase 2 — Universal table codegen ✅ DONE
+### Phase 2.5 — Even-class sign unrank algorithm ✅ DONE
+
+**Result**: The 2.9 GB `valid_signs_flat` problem dissolves entirely. The even-class
+sign constraint `Σ ε_i · v_i ≡ 0 (mod 8)` reduces algebraically to a single GF(2)
+parity equation:
+
+    popcount(b ∧ V2_mask) ≡ T (mod 2)
+    where V2_mask = { i : v_i ≡ 2 mod 4 }, T = (Σ v_i) / 4 mod 2
+
+Per-class metadata needed: `(V2_mask: uint32, dep_bit: int8, T: uint8)` = 8 B/class.
+
+Unrank kernel (`tools/prototype_sign_unrank.py:unrank`):
+```python
+def unrank(s_idx, meta):
+    if meta.nv2_zero:
+        return s_idx
+    lo_mask = (1 << meta.dep_bit) - 1
+    p = (s_idx & lo_mask) | ((s_idx >> meta.dep_bit) << (meta.dep_bit + 1))
+    cur_parity = popcount(p & meta.V2_mask) & 1
+    p |= ((cur_parity ^ meta.T) & 1) << meta.dep_bit
+    return p
+```
+
+CUDA mapping: ≤10 PTX ops, branchless inside the inner loop. Predicated `selp`
+on `nv2_zero` (warp-uniform per class once parity-sorted at tensor-load).
+
+**Verification at ms=13**: ALL 83,287,790 (class, s_idx) pairs bit-identical to
+`valid_signs_flat[]`. 100% match across 226 even classes.
+
+**Storage collapse**:
+| Bundle | Old table | New metadata | Reduction |
+|---|---|---|---|
+| ms=13 | 635 MB | 3 KB | 217,462× |
+| ms=18 | ~2.9 GB | ~10 KB | ~290,000× |
+
+Plan implication: Phase 3's CUDA decoder is now **entirely table-free for sign
+reconstruction** — odd path uses paper §3.3 step 4 (XOR), even path uses the new
+algebraic unrank. Both fit in constant memory + register-only arithmetic.
 - **Goal**: Generate `leech_tables_ms18.h` and `leech_tables_ms13.h` as `constexpr` C++ headers. Bake the universal Leech tables into the kernel TU at compile time.
 - **Finding (important — pre-existing kernel spec was wrong)**: `valid_signs_flat`
   is **666 MB** at ms=13 and **2.9 GB** at ms=18 — the pre-enumerated even-class
