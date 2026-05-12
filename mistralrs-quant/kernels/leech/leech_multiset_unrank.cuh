@@ -50,37 +50,65 @@ __device__ __forceinline__ int64_t perms_rem_k(
 // out and rem_scratch are int8 caller scratch (values fit — Leech lattice
 // coords are bounded by ±32 and counts by 24). This 8x reduction in scratch
 // type avoids local-memory spill on the per-thread scratch arrays.
+// Byte-packed array accessors. Storing 24 int8 values as 6 uint32 keeps the
+// per-thread state in registers (vs spilling to local memory). Access uses
+// shift/mask which nvcc lowers to PRMT (~1 cycle) on Ampere+.
+__device__ __forceinline__ int8_t pk_get(const uint32_t* a, int i) {
+    return static_cast<int8_t>((a[i >> 2] >> ((i & 3) << 3)) & 0xFFu);
+}
+__device__ __forceinline__ void pk_set(uint32_t* a, int i, int v) {
+    int shift = (i & 3) << 3;
+    uint32_t mask = ~(0xFFu << shift);
+    a[i >> 2] = (a[i >> 2] & mask) | ((static_cast<uint32_t>(v) & 0xFFu) << shift);
+}
+
+// perms_rem_k variant on packed rem_scratch.
+__device__ __forceinline__ int64_t perms_rem_k_packed(
+    const uint32_t* rem_packed, int k, int64_t n_rem
+) {
+    int64_t result = 1;
+    int64_t rem = n_rem;
+    for (int idx = 0; idx < k; ++idx) {
+        int64_t c = static_cast<int64_t>(pk_get(rem_packed, idx));
+        result *= binom_small(rem, c);
+        rem -= c;
+    }
+    return result;
+}
+
+// Unrank into packed `out` (uint32_t* with 6 elements covering 24 bytes).
+// rem_scratch_packed has 2 elements (8 bytes) — k ≤ 8 fits.
 __device__ __forceinline__ void unrank_multiset(
     int64_t  rank,
     const int64_t* dist_vals,
     const int64_t* counts,
     int      k,
     int      n,
-    int8_t*  out,
-    int8_t*  rem_scratch
+    uint32_t* out_packed,
+    uint32_t* rem_packed
 ) {
-    // counts and dist_vals are __device__ read-only — use __ldg to route
-    // through the read-only/texture cache (separate from L1).
-    int8_t dist_cache[16];  // k ≤ 8 typically; 16 is safe upper bound
-    int8_t counts_cache[16];
+    // Pack dist_cache as uint32_t[2] (8 bytes — k ≤ 8 fits). Stays in
+    // registers vs the int8[16] which the compiler used to spill to stack.
+    uint32_t dist_pk[2] = {0, 0};
     for (int i = 0; i < k; ++i) {
-        dist_cache[i] = static_cast<int8_t>(__ldg(&dist_vals[i]));
-        counts_cache[i] = static_cast<int8_t>(__ldg(&counts[i]));
-        rem_scratch[i] = counts_cache[i];
+        int8_t cnt_val = static_cast<int8_t>(__ldg(&counts[i]));
+        int8_t dist_val = static_cast<int8_t>(__ldg(&dist_vals[i]));
+        pk_set(dist_pk, i, dist_val);
+        pk_set(rem_packed, i, cnt_val);
     }
     int64_t r = rank;
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < k; ++j) {
-            int8_t cnt = rem_scratch[j];
-            int8_t avail = (cnt > 0) ? 1 : 0;
-            rem_scratch[j] = static_cast<int8_t>(cnt - avail);
-            int64_t block = (avail == 1) ? perms_rem_k(rem_scratch, k, n - i - 1) : 0;
+            int cnt = static_cast<int>(pk_get(rem_packed, j));
+            int avail = (cnt > 0) ? 1 : 0;
+            pk_set(rem_packed, j, cnt - avail);
+            int64_t block = (avail == 1) ? perms_rem_k_packed(rem_packed, k, n - i - 1) : 0;
             if (avail == 1 && r < block) {
-                out[i] = dist_cache[j];
+                pk_set(out_packed, i, static_cast<int>(pk_get(dist_pk, j)));
                 goto next_i;
             }
             r -= block * avail;
-            rem_scratch[j] = static_cast<int8_t>(rem_scratch[j] + avail);
+            pk_set(rem_packed, j, static_cast<int>(pk_get(rem_packed, j)) + avail);
         }
         next_i:;
     }
