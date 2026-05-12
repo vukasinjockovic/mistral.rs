@@ -36,6 +36,9 @@ regex.workspace = true
 hf-hub.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+mistralrs-leech = { path = "../mistralrs-leech" }
+
 [features]
 cuda = [
     "candle-core/cuda",
