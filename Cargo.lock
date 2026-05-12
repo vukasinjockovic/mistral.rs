@@ -3609,6 +3609,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mistralrs-leech"
+version = "0.8.1"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "half",
+ "hex",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mistralrs-macros"
 version = "0.8.1"
 dependencies = [

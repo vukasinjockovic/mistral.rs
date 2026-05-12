@@ -9,6 +9,7 @@ members = [
     "mistralrs-bench",
     "mistralrs-vision",
     "mistralrs-quant",
+    "mistralrs-leech",
     "mistralrs-paged-attn",
     "mistralrs-web-chat",
     "mistralrs-audio",
