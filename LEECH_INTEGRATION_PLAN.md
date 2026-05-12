@@ -44,8 +44,26 @@ Six phases, all on `leech-quant`. Each phase has a verification gate; no phase s
   4. Reads the manifest JSON and confirms 248 LLVQ + 2 fp8 + 177 bf16 = 427 tensors.
   5. Manifest SHA-256 digests match the file on disk.
 
-### Phase 2 — Universal table codegen (1 day)
+### Phase 2 — Universal table codegen ✅ DONE (commit pending)
 - **Goal**: Generate `leech_tables_ms18.h` and `leech_tables_ms13.h` as `constexpr` C++ headers. Bake the universal Leech tables into the kernel TU at compile time.
+- **Finding (important — pre-existing kernel spec was wrong)**: `valid_signs_flat`
+  is **666 MB** at ms=13 and **2.9 GB** at ms=18 — the pre-enumerated even-class
+  sign table cannot be baked into a header. It is omitted from the generated
+  headers. Phase 3's CUDA decoder must replace the lookup with an **algorithmic
+  sign unrank** derived from the per-class `nz_distinct_desc` / `f0_counts` /
+  `f1_counts` / `parity` metadata. The paper's §3.3 step 4 already does this
+  for odd classes (XOR with codeword); even classes need the same treatment.
+- **Actual baked totals**:
+  | ms_max | n_classes | baked bytes | header bytes | omitted (signs) |
+  |---|---|---|---|---|
+  | 13 | 383 | 3.7 MB | 9 MB | 666 MB |
+  | 18 | 1209 | 12 MB | 29 MB | 2.9 GB |
+- **Dtype narrowing**: `codewords_flat` was narrowed `int64 → uint32` (Golay
+  codewords are 24-bit). Halves the dominant array.
+- **Storage strategy for Phase 3**: per-class scalars (A, two_B, parity, etc.,
+  ~10–30 KB) → `__constant__`. The medium-sized ragged arrays (codewords_flat
+  at ~12 MB) → `__device__` initialized from the constexpr header. `nvcc` handles
+  the binary-bake automatically.
 - **Files** (new):
   - `tools/gen_leech_tables.py` (in antsquant repo, NOT mistral.rs) — runs `build_flat_tables(ms_max=M)` and emits a `.h` file
   - `mistralrs-quant/kernels/leech/leech_tables_ms13.h` (committed; generated artefact)
