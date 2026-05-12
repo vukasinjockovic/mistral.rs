@@ -107,7 +107,8 @@ impl QuantMethod for AfqLayer {
             | QuantMethodConfig::BlockwiseFP8 { .. }
             | QuantMethodConfig::PerTensorFP8 { .. }
             | QuantMethodConfig::Unquantized(_)
-            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
+            | QuantMethodConfig::MXFP4 { .. }
+            | QuantMethodConfig::Leech { .. } => unreachable!(),
             QuantMethodConfig::Afq {
                 weight,
                 bias,

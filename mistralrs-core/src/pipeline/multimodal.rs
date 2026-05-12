@@ -373,6 +373,8 @@ impl Loader for MultimodalLoader {
                                 }
                                 QuantizedSerdeType::F8Q8 => IsqType::F8Q8.pack_factor(dtype),
                                 QuantizedSerdeType::Mxfp4 => IsqType::MXFP4.pack_factor(dtype),
+                                // .leech is bf16 → ~2.5 bpw; pack factor ≈ Q2K's.
+                                QuantizedSerdeType::Leech => IsqType::Q2K.pack_factor(dtype),
                             };
                             total_pack_factors += pack_factor;
                         }

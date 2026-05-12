@@ -98,7 +98,8 @@ impl QuantMethod for GgufMatMul {
             | QuantMethodConfig::BlockwiseFP8 { .. }
             | QuantMethodConfig::PerTensorFP8 { .. }
             | QuantMethodConfig::Afq { .. }
-            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
+            | QuantMethodConfig::MXFP4 { .. }
+            | QuantMethodConfig::Leech { .. } => unreachable!(),
         }
     }
 

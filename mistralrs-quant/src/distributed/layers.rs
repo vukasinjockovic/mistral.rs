@@ -106,6 +106,9 @@ impl RowParallelLayer {
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
+                QuantizedConfig::Leech { .. } => {
+                    crate::leech::leech_linear(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
             }
         } else {
             // Handle the case where the layer is dummy (no tensors)
@@ -323,6 +326,9 @@ impl QuantizedSerde for RowParallelLayer {
             QuantizedSerdeType::Afq => AfqLayer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Leech => candle_core::bail!(
+                "LeechLayer UQFF deserialize is Phase 5b — load via the .leech sidecar instead"
+            ),
         };
         Ok(Arc::new(Self {
             weight,
@@ -407,6 +413,9 @@ impl ColumnParallelLayer {
                 }
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::Leech { .. } => {
+                    crate::leech::leech_linear(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
             }
         } else {
@@ -656,6 +665,9 @@ impl QuantizedSerde for ColumnParallelLayer {
             QuantizedSerdeType::Afq => AfqLayer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
+            QuantizedSerdeType::Leech => candle_core::bail!(
+                "LeechLayer UQFF deserialize is Phase 5b — load via the .leech sidecar instead"
+            ),
         };
         Ok(Arc::new(Self { weight, bias }))
     }
@@ -769,6 +781,9 @@ impl ReplicatedLayer {
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
+                QuantizedConfig::Leech { .. } => {
+                    crate::leech::leech_linear(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
             }
         } else {
             // Handle the case where the layer is dummy (no tensors)
@@ -851,6 +866,9 @@ impl ReplicatedLayer {
                 }
                 QuantizedConfig::MXFP4 {} => {
                     MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, bias, vb.clone())?
+                }
+                QuantizedConfig::Leech { .. } => {
+                    crate::leech::leech_linear(in_dim, out_dim, quant_conf, bias, vb.clone())?
                 }
             }
         } else {
@@ -989,6 +1007,9 @@ impl QuantizedSerde for ReplicatedLayer {
             QuantizedSerdeType::Afq => AfqLayer::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize(data, device, comm, guard)?,
+            QuantizedSerdeType::Leech => candle_core::bail!(
+                "LeechLayer UQFF deserialize is Phase 5b — load via the .leech sidecar instead"
+            ),
         };
         Ok(Arc::new(Self(deserialized)))
     }

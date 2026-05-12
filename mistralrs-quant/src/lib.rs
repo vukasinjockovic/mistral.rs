@@ -296,6 +296,18 @@ pub enum QuantizedConfig {
         group_size: usize,
     },
     MXFP4 {},
+    /// `.leech` LLVQ-quantized weight (Niemeier Λ24 / Golay G24).
+    /// See `mistralrs-quant/src/leech/` and the companion `mistralrs-leech` crate.
+    Leech {
+        /// Maximum shell index used during encoding. Currently {13, 18} are
+        /// supported by the CUDA kernel templates.
+        ms_used: u8,
+        /// Per-block i_global bit width. ms=18 → 54, ms=13 → 48.
+        idx_bits: u8,
+        /// Whether each block carries the 3-bit per-row offset codebook index
+        /// (dash-q layer on top of LLVQ).
+        has_offset: bool,
+    },
 }
 
 // Common fields for all variants
@@ -307,6 +319,12 @@ struct RawConfig {
     checkpoint_format: Option<String>,
     weight_block_size: Option<Vec<usize>>,
     bnb_4bit_quant_type: Option<String>,
+    /// Leech: maximum shell index used during encoding.
+    ms_used: Option<u8>,
+    /// Leech: per-block i_global bit width.
+    idx_bits: Option<u8>,
+    /// Leech: whether each block has the 3-bit offset codebook index.
+    has_offset: Option<bool>,
 }
 
 // Custom deserializer implementation
@@ -353,6 +371,20 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
             Some(m) if m == "mxfp4" => {
                 Ok(QuantizedConfig::MXFP4 {  })
             }
+            Some(m) if m == "leech" => {
+                let ms_used = raw
+                    .ms_used
+                    .ok_or_else(|| serde::de::Error::missing_field("ms_used"))?;
+                let idx_bits = raw
+                    .idx_bits
+                    .ok_or_else(|| serde::de::Error::missing_field("idx_bits"))?;
+                let has_offset = raw.has_offset.unwrap_or(true);
+                Ok(QuantizedConfig::Leech {
+                    ms_used,
+                    idx_bits,
+                    has_offset,
+                })
+            }
             None => {
                 let bits = raw
                     .bits
@@ -364,7 +396,7 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
             }
             Some(unknown_method) => {
                 Err(serde::de::Error::custom(format!(
-                    "Unknown quantization method: {unknown_method}. Expected one of: gptq, fp8, bitsandbytes, afq, or not specified"
+                    "Unknown quantization method: {unknown_method}. Expected one of: gptq, fp8, bitsandbytes, afq, mxfp4, leech, or not specified"
                 )))
             },
         }
@@ -379,6 +411,7 @@ impl QuantizedConfig {
             Self::Bitsandbytes { .. } => "bitsandbytes",
             Self::Afq { .. } => "afq",
             Self::MXFP4 { .. } => "mxfp4",
+            Self::Leech { .. } => "leech",
         }
     }
 
@@ -394,6 +427,11 @@ impl QuantizedConfig {
             } => "8 bits".to_string(),
             Self::Afq { bits, .. } => format!("{bits} bits"),
             Self::MXFP4 {} => format!("{} bits", mxfp4::N_BITS),
+            // 24 dims/block, idx_bits + 3 (β) + 3 (offset) bits → ~2.5 bpw at ms=18.
+            Self::Leech { idx_bits, has_offset, .. } => {
+                let per_block_bits = *idx_bits as f64 + 3.0 + if *has_offset { 3.0 } else { 0.0 };
+                format!("{:.2} bpw", per_block_bits / 24.0)
+            }
         }
     }
 
@@ -417,6 +455,10 @@ impl QuantizedConfig {
                 bnb_4bit_quant_type: None,
             } => IsqType::Q4K.pack_factor(dtype),
             Self::MXFP4 {} => IsqType::Q4_0.pack_factor(dtype),
+            // bf16 → ~2.5 bpw → factor of ~6.4. Use Q2K (which gives ~6) as the
+            // closest existing tier; ISQ paths over leech are bailed on, so this
+            // is only consulted by report/log code.
+            Self::Leech { .. } => IsqType::Q2K.pack_factor(dtype),
         }
     }
 }
@@ -484,6 +526,32 @@ pub enum QuantMethodConfig {
     MXFP4 {
         blocks: Tensor,
         scales: Tensor,
+        bias: Option<Tensor>,
+    },
+    /// `.leech` LLVQ-quantized layer. Carries device-side packed body + codebooks.
+    /// Loaded from a `.leech` container by the Phase 5 sidecar loader.
+    /// See `mistralrs-quant/src/leech/`.
+    Leech {
+        /// Packed bit-stream of LLVQ block indices (u8 device buffer).
+        packed_stream: Tensor,
+        /// Per-row β codebook (fp16, shape `[R, K_beta]`).
+        beta_codebook: Tensor,
+        /// Per-row offset codebook (fp16, shape `[R, K_offset]`). `None` if !has_offset.
+        offset_codebook: Option<Tensor>,
+        /// Number of rows in the decoded weight.
+        rows: u32,
+        /// Number of LLVQ blocks per row (= n_done / 24).
+        blocks_per_row: u32,
+        /// Per-block i_global bit width. ms=18 → 54, ms=13 → 48.
+        idx_bits: u8,
+        /// Whether each block carries the 3-bit offset codebook index.
+        has_offset: bool,
+        /// Maximum shell index used during encoding (selects kernel template).
+        ms_used: u8,
+        /// Optional bf16 leftover columns when in_features % 24 != 0 (zero-elided
+        /// case leaves this `None`; verbatim case stores the bf16 slab).
+        leftover_bf16: Option<Tensor>,
+        /// Optional bias.
         bias: Option<Tensor>,
     },
 }
@@ -852,6 +920,7 @@ pub enum QuantizedSerdeType {
     Afq = 4,
     F8Q8 = 5,
     Mxfp4 = 6,
+    Leech = 7,
 }
 
 impl TryFrom<usize> for QuantizedSerdeType {
@@ -865,6 +934,7 @@ impl TryFrom<usize> for QuantizedSerdeType {
             4 => Ok(Self::Afq),
             5 => Ok(Self::F8Q8),
             6 => Ok(Self::Mxfp4),
+            7 => Ok(Self::Leech),
             other => candle_core::bail!("QuantizedSerdeType {other} is invalid."),
         }
     }
@@ -1107,6 +1177,9 @@ pub fn linear_no_bias(
             QuantizedConfig::MXFP4 {} => {
                 MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, false, vb)?
             }
+            QuantizedConfig::Leech { .. } => {
+                leech::leech_linear(in_dim, out_dim, quant_conf, false, vb)?
+            }
         }
     } else {
         // Handle the case where the layer is dummy (no tensors)
@@ -1171,6 +1244,9 @@ pub fn linear(
             }
             QuantizedConfig::MXFP4 {} => {
                 MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
+            }
+            QuantizedConfig::Leech { .. } => {
+                leech::leech_linear(in_dim, out_dim, quant_conf, true, vb)?
             }
         }
     } else {

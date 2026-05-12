@@ -342,7 +342,8 @@ impl QuantMethod for GptqLayer {
             | QuantMethodConfig::BlockwiseFP8 { .. }
             | QuantMethodConfig::PerTensorFP8 { .. }
             | QuantMethodConfig::Afq { .. }
-            | QuantMethodConfig::MXFP4 { .. } => {
+            | QuantMethodConfig::MXFP4 { .. }
+            | QuantMethodConfig::Leech { .. } => {
                 unreachable!()
             }
         }

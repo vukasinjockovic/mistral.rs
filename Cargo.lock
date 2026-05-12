@@ -3710,6 +3710,7 @@ dependencies = [
  "hf-hub",
  "lazy_static",
  "memmap2",
+ "mistralrs-leech",
  "objc2-foundation",
  "objc2-metal",
  "paste",

@@ -1149,6 +1149,9 @@ pub trait IsqModel {
                                         &comm,
                                         guard.clone(),
                                     )?,
+                                    QuantizedSerdeType::Leech => candle_core::bail!(
+                                        "LeechLayer UQFF deserialize is Phase 5b"
+                                    ),
                                 }
                             }
                         };
@@ -1234,6 +1237,9 @@ pub trait IsqModel {
                                         &comm,
                                         guard.clone(),
                                     )?,
+                                    QuantizedSerdeType::Leech => candle_core::bail!(
+                                        "LeechLayer UQFF deserialize is Phase 5b"
+                                    ),
                                 }
                             }
                         };
