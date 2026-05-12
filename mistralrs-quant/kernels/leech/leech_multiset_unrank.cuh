@@ -18,15 +18,16 @@
 
 namespace leech {
 
-// Branchless binomial(n, k) for small k (k ≤ 24).
+// Precomputed binomial(n, k) table for n ≤ 24. Initialized once per process via
+// leech_init_binom() (called from leech_init_tables_ffi). All values fit in
+// int64. Table size: 25 × 25 × 8 = 5000 bytes (well within __constant__ budget).
+__constant__ int64_t c_binom_table[25][25];
+
+// Branchless binomial(n, k) for small k (k ≤ 24). One __constant__ load —
+// previously was a loop of length min(k, n-k).
 __device__ __forceinline__ int64_t binom_small(int64_t n, int64_t k) {
-    if (k < 0 || k > n) return 0;
-    if (k > n - k) k = n - k;
-    int64_t r = 1;
-    for (int64_t i = 0; i < k; ++i) {
-        r = r * (n - i) / (i + 1);
-    }
-    return r;
+    if (k < 0 || k > n || n > 24) return 0;
+    return c_binom_table[n][k];
 }
 
 // Multinomial(rem_scratch[0..k]; n_rem) via successive binomials.
@@ -58,7 +59,15 @@ __device__ __forceinline__ void unrank_multiset(
     int8_t*  out,
     int8_t*  rem_scratch
 ) {
-    for (int i = 0; i < k; ++i) rem_scratch[i] = static_cast<int8_t>(counts[i]);
+    // counts and dist_vals are __device__ read-only — use __ldg to route
+    // through the read-only/texture cache (separate from L1).
+    int8_t dist_cache[16];  // k ≤ 8 typically; 16 is safe upper bound
+    int8_t counts_cache[16];
+    for (int i = 0; i < k; ++i) {
+        dist_cache[i] = static_cast<int8_t>(__ldg(&dist_vals[i]));
+        counts_cache[i] = static_cast<int8_t>(__ldg(&counts[i]));
+        rem_scratch[i] = counts_cache[i];
+    }
     int64_t r = rank;
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < k; ++j) {
@@ -67,8 +76,7 @@ __device__ __forceinline__ void unrank_multiset(
             rem_scratch[j] = static_cast<int8_t>(cnt - avail);
             int64_t block = (avail == 1) ? perms_rem_k(rem_scratch, k, n - i - 1) : 0;
             if (avail == 1 && r < block) {
-                out[i] = static_cast<int8_t>(dist_vals[j]);
-                // mark break: keep rem_scratch[j] decremented and exit j-loop
+                out[i] = dist_cache[j];
                 goto next_i;
             }
             r -= block * avail;

@@ -74,6 +74,19 @@ __device__ int64_t  d_nz_ofs        [sizeof(ltab::nz_ofs)            / sizeof(in
 // Declared inline-friendly so the Rust FFI side can drive it without a
 // separate .cu file.
 __host__ inline void leech_init_tables() {
+    // Precompute and upload the 25x25 binomial table once per process.
+    {
+        int64_t host_binom[25][25];
+        for (int n = 0; n < 25; ++n) {
+            for (int k = 0; k < 25; ++k) host_binom[n][k] = 0;
+            host_binom[n][0] = 1;
+            for (int k = 1; k <= n; ++k) {
+                host_binom[n][k] =
+                    host_binom[n - 1][k - 1] + (k <= n - 1 ? host_binom[n - 1][k] : 0);
+            }
+        }
+        cudaMemcpyToSymbol(c_binom_table, host_binom, sizeof(host_binom));
+    }
     cudaMemcpyToSymbol(c_N_cumulative,        ltab::N_cumulative,        sizeof(ltab::N_cumulative));
     cudaMemcpyToSymbol(c_shell_class_start,   ltab::shell_class_start,   sizeof(ltab::shell_class_start));
     cudaMemcpyToSymbol(c_shell_class_count,   ltab::shell_class_count,   sizeof(ltab::shell_class_count));
@@ -115,20 +128,31 @@ __device__ __forceinline__ int lookup_shell(uint64_t i_global) {
     return ltab::MS_MAX;  // shouldn't reach
 }
 
+// Binary search over the (shell, class) cumulative offset array — finds the
+// unique class index g in [sc_start, sc_start + sc_count) such that
+//   c_class_cum_offset[g] ≤ I_shell < c_class_cum_offset[g+1]
+// (with c_class_cum_offset[sc_start + sc_count] := shell_total implicit).
+//
+// Linear scan was O(sc_count) ≈ 50-100 per decode at ms=18. Binary search is
+// O(log sc_count) ≈ 7. The c_class_cum_offset array is sorted-ascending by
+// construction (it's a cumulative count), so binary search is valid.
 __device__ __forceinline__ int lookup_class(int m, int64_t I_shell) {
     int sc_start = c_shell_class_start[m];
     int sc_count = c_shell_class_count[m];
     int64_t shell_total = static_cast<int64_t>(c_N_cumulative[m + 1] - c_N_cumulative[m]);
-    for (int jj = 0; jj < sc_count; ++jj) {
-        int g = sc_start + jj;
-        int64_t next_off = (jj + 1 < sc_count)
-                         ? c_class_cum_offset[g + 1]
-                         : shell_total;
+    int lo = 0;
+    int hi = sc_count;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        int g = sc_start + mid;
+        int64_t next_off = (mid + 1 < sc_count) ? c_class_cum_offset[g + 1] : shell_total;
         if (I_shell < next_off) {
-            return g;
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
     }
-    return sc_start;  // unreachable on valid input
+    return sc_start + lo;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -418,7 +442,7 @@ __global__ void leech_decode_bf16_kernel(
 // Activations are staged once per CTA in shared memory so all 4 warps share
 // the same activation row.
 template<int IDX_BITS, int BETA_BITS, int OFFSET_BITS, bool HAS_OFFSET>
-__global__ void __launch_bounds__(128, 8) leech_gemv_bf16_kernel(
+__global__ void __launch_bounds__(128, 12) leech_gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ a_act,         // [m, b_blocks*24]
     const uint8_t*       __restrict__ packed_stream,
     const __half*        __restrict__ beta_codebook, // [n_rows, k_beta]
