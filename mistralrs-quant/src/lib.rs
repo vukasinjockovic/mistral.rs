@@ -28,6 +28,7 @@ mod gguf;
 mod gptq;
 mod hqq;
 mod imatrix;
+pub mod leech;
 mod lora;
 mod mxfp4;
 mod pending_layer;
