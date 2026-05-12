@@ -127,24 +127,30 @@ impl QuantMethod for LeechLayer {
     }
 
     fn dequantize_w(&self) -> Result<Tensor> {
-        // Phase 5 prep: this is the slow but correct path used by ISQ /
-        // LoRA-merge / debug. It mirrors `payload.py:reconstruct_bf16_from_streams`:
-        //   1. Run the decode-only CUDA kernel → int8[R, B, 24] device tensor.
-        //   2. Apply β·v + offset (fp32 fma) → bf16 cast.
-        //   3. Concatenate the optional leftover slab onto the right edge.
-        //
-        // Phase 4's `forward_raw` fuses steps 1+2 plus the activation GEMM —
-        // this path stays around for ISQ even after that lands.
-        candle_core::bail!(
-            "leech: dequantize_w not yet wired — Phase 4 will compose decode-only kernel \
-             with bf16 epilogue. Phase 5 prep stub."
-        )
+        #[cfg(feature = "cuda")]
+        {
+            self.dequantize_w_cuda()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            candle_core::bail!(
+                "leech: dequantize_w requires the cuda feature — CPU path not yet implemented"
+            )
+        }
     }
 
-    fn forward_raw(&self, _a: &Tensor) -> Result<Tensor> {
-        candle_core::bail!(
-            "leech: forward_raw (fused decode+GEMM) lands in Phase 4 — not yet implemented"
-        )
+    fn forward_raw(&self, a: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        {
+            self.forward_raw_cuda(a)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = a;
+            candle_core::bail!(
+                "leech: forward_raw requires the cuda feature — CPU path not yet implemented"
+            )
+        }
     }
 
     fn quantized_act_type(&self) -> Option<DType> {
@@ -226,5 +232,289 @@ impl LeechLayer {
     /// Output features = rows.
     pub fn out_features(&self) -> usize {
         self.rows as usize
+    }
+}
+
+// ─── CUDA forward / dequantize implementation (Phase 4.0a) ────────────────
+
+#[cfg(feature = "cuda")]
+impl LeechLayer {
+    /// Phase 4.0a dequantize: one kernel that decodes + applies the LOCKED
+    /// epilogue `bf16 = RNE(fp32(β · v_int + offset))` into a contiguous
+    /// `[rows, blocks_per_row * 24]` bf16 weight tensor. If `leftover_bf16` is
+    /// present it gets concatenated on the right.
+    fn dequantize_w_cuda(&self) -> Result<Tensor> {
+        use candle_core::cuda::cudarc::driver::DevicePtr;
+        use candle_core::{CudaStorage, Shape, Storage};
+        use half::{bf16, f16};
+        use std::ffi::c_void;
+
+        use crate::leech::leech_decode_bf16;
+        use crate::utils::slice_ptr;
+
+        let cuda = match &self.device {
+            Device::Cuda(d) => d,
+            _ => candle_core::bail!("LeechLayer::dequantize_w_cuda: device is not CUDA"),
+        };
+
+        // packed_stream is a Tensor of u8 (contiguous device buffer).
+        let (ps_s, ps_l) = self.packed_stream.storage_and_layout();
+        let Storage::Cuda(ps_s) = &*ps_s else {
+            candle_core::bail!("packed_stream not on CUDA");
+        };
+        let ps_slice = ps_s.as_cuda_slice::<u8>()?;
+        let (ps_ptr, _ps_guard) = slice_ptr(ps_slice, ps_l.start_offset());
+
+        // beta_codebook: f16, shape [rows, k_beta].
+        let (bc_s, bc_l) = self.beta_codebook.storage_and_layout();
+        let Storage::Cuda(bc_s) = &*bc_s else {
+            candle_core::bail!("beta_codebook not on CUDA");
+        };
+        let bc_slice = bc_s.as_cuda_slice::<f16>()?;
+        let (bc_ptr, _bc_guard) = slice_ptr(bc_slice, bc_l.start_offset());
+
+        // Derive K_beta and K_offset from codebook shapes.
+        let k_beta = self.beta_codebook.dim(1)? as u32;
+        let k_offset = self
+            .offset_codebook
+            .as_ref()
+            .map(|t| t.dim(1).unwrap() as u32)
+            .unwrap_or(0);
+
+        // Allocate the dequantized weight buffer: [rows, blocks_per_row * 24] bf16.
+        let n_done = self.blocks_per_row as usize * 24;
+        let out_elems = self.rows as usize * n_done;
+        let out_buf = cuda.alloc_zeros::<bf16>(out_elems)?;
+        let stream = cuda.cuda_stream();
+        let (out_ptr_u64, _out_guard) = out_buf.device_ptr(&stream);
+        let stream_raw = stream.cu_stream() as *mut c_void;
+
+        // Kernel call needs all guards live. Doing it inside the optional-offset
+        // match keeps the offset_codebook guard alive across the launch without
+        // a self-referential struct.
+        match self.offset_codebook.as_ref() {
+            Some(t) => {
+                let (oc_s, oc_l) = t.storage_and_layout();
+                let Storage::Cuda(oc_s) = &*oc_s else {
+                    candle_core::bail!("offset_codebook not on CUDA");
+                };
+                let oc_slice = oc_s.as_cuda_slice::<f16>()?;
+                let (offset_ptr_u64, _oc_guard) = slice_ptr(oc_slice, oc_l.start_offset());
+                unsafe {
+                    leech_decode_bf16(
+                        ps_ptr as *const u8,
+                        bc_ptr as *const c_void,
+                        offset_ptr_u64 as *const c_void,
+                        out_ptr_u64 as *mut c_void,
+                        self.rows,
+                        self.blocks_per_row,
+                        k_beta,
+                        k_offset,
+                        self.idx_bits as u32,
+                        self.has_offset,
+                        stream_raw,
+                    )
+                    .map_err(|e| candle_core::Error::Msg(format!("leech_decode_bf16: {e}")))?;
+                }
+                drop(_oc_guard);
+            }
+            None => {
+                unsafe {
+                    leech_decode_bf16(
+                        ps_ptr as *const u8,
+                        bc_ptr as *const c_void,
+                        std::ptr::null::<c_void>(),
+                        out_ptr_u64 as *mut c_void,
+                        self.rows,
+                        self.blocks_per_row,
+                        k_beta,
+                        k_offset,
+                        self.idx_bits as u32,
+                        self.has_offset,
+                        stream_raw,
+                    )
+                    .map_err(|e| candle_core::Error::Msg(format!("leech_decode_bf16: {e}")))?;
+                }
+            }
+        }
+
+        drop(_out_guard);
+        drop(_bc_guard);
+        drop(_ps_guard);
+
+        let out_storage = CudaStorage::wrap_cuda_slice(out_buf, cuda.clone());
+        let w_main = Tensor::from((
+            Storage::Cuda(out_storage),
+            Shape::from((self.rows as usize, n_done)),
+        ));
+
+        // If there's a leftover slab, concat on the right edge (dim=1).
+        match self.leftover_bf16.as_ref() {
+            Some(left) => {
+                let left_cast = if left.dtype() != DType::BF16 {
+                    left.to_dtype(DType::BF16)?
+                } else {
+                    left.clone()
+                };
+                Tensor::cat(&[w_main, left_cast], 1)
+            }
+            None => Ok(w_main),
+        }
+    }
+
+    /// Phase 4.0 forward: dispatch on M.
+    /// - M ≤ 8 (typical generation): use the fused GEMV kernel — no decoded
+    ///   weight HBM roundtrip, ~6.4 ms per large matmul on RTX 5090.
+    /// - M > 8 (prefill / batched): dequantize once, then standard bf16 matmul
+    ///   — amortizes decode across many output rows.
+    fn forward_raw_cuda(&self, a: &Tensor) -> Result<Tensor> {
+        let a_bf16 = if a.dtype() != DType::BF16 {
+            a.to_dtype(DType::BF16)?
+        } else {
+            a.clone()
+        };
+        let a_dims = a_bf16.dims().to_vec();
+        let m: usize = a_dims[..a_dims.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1);
+
+        // Currently we only support in_features = blocks_per_row * 24 in the
+        // GEMV kernel (leftover columns not yet handled in the fused path).
+        let supports_gemv = self.leftover_bf16.is_none() && m <= 8;
+
+        let y = if supports_gemv {
+            self.forward_raw_gemv(&a_bf16, m, &a_dims)?
+        } else {
+            let w = self.dequantize_w_cuda()?; // [out_features, in_features]
+            a_bf16.broadcast_matmul(&w.t()?)?
+        };
+        match self.bias.as_ref() {
+            Some(b) => {
+                let b_cast = if b.dtype() != DType::BF16 {
+                    b.to_dtype(DType::BF16)?
+                } else {
+                    b.clone()
+                };
+                y.broadcast_add(&b_cast)
+            }
+            None => Ok(y),
+        }
+    }
+
+    /// Phase 4.0b fused GEMV path.
+    fn forward_raw_gemv(&self, a_bf16: &Tensor, m: usize, a_dims: &[usize]) -> Result<Tensor> {
+        use candle_core::cuda::cudarc::driver::DevicePtr;
+        use candle_core::{CudaStorage, Shape, Storage};
+        use half::bf16;
+        use std::ffi::c_void;
+
+        use crate::leech::leech_gemv_bf16;
+        use crate::utils::slice_ptr;
+
+        let cuda = match &self.device {
+            Device::Cuda(d) => d,
+            _ => candle_core::bail!("LeechLayer::forward_raw_gemv: not CUDA"),
+        };
+
+        // Ensure activation is contiguous and shaped [M, K_total].
+        let k_total = self.blocks_per_row as usize * 24;
+        let a_flat = a_bf16.reshape((m, k_total))?.contiguous()?;
+        let (a_s, a_l) = a_flat.storage_and_layout();
+        let Storage::Cuda(a_s) = &*a_s else {
+            candle_core::bail!("activation not on CUDA");
+        };
+        let a_slice = a_s.as_cuda_slice::<bf16>()?;
+        let (a_ptr, _a_guard) = slice_ptr(a_slice, a_l.start_offset());
+
+        let (ps_s, ps_l) = self.packed_stream.storage_and_layout();
+        let Storage::Cuda(ps_s) = &*ps_s else {
+            candle_core::bail!("packed_stream not on CUDA");
+        };
+        let ps_slice = ps_s.as_cuda_slice::<u8>()?;
+        let (ps_ptr, _ps_guard) = slice_ptr(ps_slice, ps_l.start_offset());
+
+        let (bc_s, bc_l) = self.beta_codebook.storage_and_layout();
+        let Storage::Cuda(bc_s) = &*bc_s else {
+            candle_core::bail!("beta_codebook not on CUDA");
+        };
+        let bc_slice = bc_s.as_cuda_slice::<half::f16>()?;
+        let (bc_ptr, _bc_guard) = slice_ptr(bc_slice, bc_l.start_offset());
+
+        let k_beta = self.beta_codebook.dim(1)? as u32;
+        let k_offset = self
+            .offset_codebook
+            .as_ref()
+            .map(|t| t.dim(1).unwrap() as u32)
+            .unwrap_or(0);
+
+        let n_rows = self.rows;
+        let out_elems = m * n_rows as usize;
+        let out_buf = cuda.alloc_zeros::<bf16>(out_elems)?;
+        let stream = cuda.cuda_stream();
+        let (out_ptr_u64, _out_guard) = out_buf.device_ptr(&stream);
+        let stream_raw = stream.cu_stream() as *mut c_void;
+
+        match self.offset_codebook.as_ref() {
+            Some(t) => {
+                let (oc_s, oc_l) = t.storage_and_layout();
+                let Storage::Cuda(oc_s) = &*oc_s else {
+                    candle_core::bail!("offset_codebook not on CUDA");
+                };
+                let oc_slice = oc_s.as_cuda_slice::<half::f16>()?;
+                let (offset_ptr_u64, _oc_guard) = slice_ptr(oc_slice, oc_l.start_offset());
+                unsafe {
+                    leech_gemv_bf16(
+                        a_ptr as *const c_void,
+                        ps_ptr as *const u8,
+                        bc_ptr as *const c_void,
+                        offset_ptr_u64 as *const c_void,
+                        out_ptr_u64 as *mut c_void,
+                        m as u32,
+                        n_rows,
+                        self.blocks_per_row,
+                        k_beta,
+                        k_offset,
+                        self.idx_bits as u32,
+                        self.has_offset,
+                        stream_raw,
+                    )
+                    .map_err(|e| candle_core::Error::Msg(format!("leech_gemv_bf16: {e}")))?;
+                }
+                drop(_oc_guard);
+            }
+            None => {
+                unsafe {
+                    leech_gemv_bf16(
+                        a_ptr as *const c_void,
+                        ps_ptr as *const u8,
+                        bc_ptr as *const c_void,
+                        std::ptr::null::<c_void>(),
+                        out_ptr_u64 as *mut c_void,
+                        m as u32,
+                        n_rows,
+                        self.blocks_per_row,
+                        k_beta,
+                        k_offset,
+                        self.idx_bits as u32,
+                        self.has_offset,
+                        stream_raw,
+                    )
+                    .map_err(|e| candle_core::Error::Msg(format!("leech_gemv_bf16: {e}")))?;
+                }
+            }
+        }
+        drop(_out_guard);
+        drop(_bc_guard);
+        drop(_ps_guard);
+        drop(_a_guard);
+
+        let out_storage = CudaStorage::wrap_cuda_slice(out_buf, cuda.clone());
+        let mut out_shape: Vec<usize> = a_dims[..a_dims.len().saturating_sub(1)].to_vec();
+        out_shape.push(n_rows as usize);
+        Ok(Tensor::from((
+            Storage::Cuda(out_storage),
+            Shape::from(out_shape),
+        )))
     }
 }

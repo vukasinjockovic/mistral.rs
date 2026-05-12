@@ -11,7 +11,9 @@ use std::ffi::c_void;
 use std::fmt;
 use std::sync::OnceLock;
 
-use crate::leech::ffi::{leech_decode_v_int_cuda, leech_init_tables_ffi};
+use crate::leech::ffi::{
+    leech_decode_bf16_cuda, leech_decode_v_int_cuda, leech_gemv_bf16_cuda, leech_init_tables_ffi,
+};
 
 /// Sticky one-shot init.
 static TABLES_INITIALIZED: OnceLock<()> = OnceLock::new();
@@ -122,6 +124,124 @@ pub fn leech_decode_v_int(
             packed_stream.as_ptr(),
             out_v_int.as_mut_ptr(),
             n_blocks,
+            idx_bits as std::os::raw::c_int,
+            if has_offset { 1 } else { 0 },
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Phase 4.0a: decode + β·v + offset → bf16 weight tile in one kernel.
+///
+/// All buffers are DEVICE pointers. This is the fused replacement for the
+/// `decode_v_int → fp32 FMA → bf16` two-pass chain — eliminates the int8 HBM
+/// roundtrip and runs the LOCKED epilogue (`bf16 = RNE(fp32(β·v + offset))`)
+/// inline per block.
+///
+/// # Args
+/// - `packed_stream`: device-side body bitstream, tail-padded by ≥ 8 bytes.
+/// - `beta_codebook_ptr`: device pointer to `R * K_beta` fp16 entries.
+/// - `offset_codebook_ptr`: device pointer to `R * K_offset` fp16 entries; pass
+///   null if `has_offset` is false.
+/// - `out_weight_bf16_ptr`: device pointer to `R * B * 24` bf16 entries.
+/// - `r_rows` / `b_blocks` / `k_beta` / `k_offset`: tensor dimensions.
+/// - `idx_bits`: 48 (ms=13) or 54 (ms=18).
+/// - `has_offset`: whether per-block offset bits are present.
+/// - `stream`: optional CUDA stream pointer.
+///
+/// # Safety
+/// All pointers must be device-allocated and sized correctly. Callers should
+/// hold their `CudaSlice<T>` guards alive across the call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_decode_bf16(
+    packed_stream: *const u8,
+    beta_codebook_ptr: *const c_void,
+    offset_codebook_ptr: *const c_void,
+    out_weight_bf16_ptr: *mut c_void,
+    r_rows: u32,
+    b_blocks: u32,
+    k_beta: u32,
+    k_offset: u32,
+    idx_bits: u32,
+    has_offset: bool,
+    stream: *mut c_void,
+) -> Result<(), LeechDecodeError> {
+    init_tables()?;
+    if idx_bits != 48 && idx_bits != 54 {
+        return Err(LeechDecodeError::UnsupportedIdxBits(idx_bits));
+    }
+    unsafe {
+        leech_decode_bf16_cuda(
+            packed_stream,
+            beta_codebook_ptr,
+            offset_codebook_ptr,
+            out_weight_bf16_ptr,
+            r_rows,
+            b_blocks,
+            k_beta,
+            k_offset,
+            idx_bits as std::os::raw::c_int,
+            if has_offset { 1 } else { 0 },
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Phase 4.0b: fused decode + β·v + offset + GEMV → bf16 output. All buffers
+/// are DEVICE pointers. Each output element is computed by one thread that
+/// walks its weight row's blocks in-register. Best at batch=1 generation.
+///
+/// # Args
+/// - `a_act_bf16`: device pointer to `[m, b_blocks*24]` bf16 activations.
+/// - `packed_stream`: device, weight bitstream tail-padded by ≥ 8 bytes.
+/// - `beta_codebook_ptr`: device pointer to `[n_rows, k_beta]` fp16 entries.
+/// - `offset_codebook_ptr`: device pointer to `[n_rows, k_offset]` fp16 entries;
+///   pass null if `has_offset` is false.
+/// - `out_y_bf16`: device pointer to `[m, n_rows]` bf16 output.
+/// - `m`: batch rows.
+/// - `n_rows`: weight output features (= `LeechLayer::rows`).
+/// - `b_blocks`: blocks per weight row.
+/// - `k_beta` / `k_offset`: codebook widths.
+/// - `idx_bits`: 48 (ms=13) or 54 (ms=18).
+/// - `has_offset`: whether per-block offset bits are present.
+/// - `stream`: optional CUDA stream pointer.
+///
+/// # Safety
+/// All pointers must be device-allocated; caller holds CudaSlice guards alive.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_gemv_bf16(
+    a_act_bf16_ptr: *const c_void,
+    packed_stream: *const u8,
+    beta_codebook_ptr: *const c_void,
+    offset_codebook_ptr: *const c_void,
+    out_y_bf16_ptr: *mut c_void,
+    m: u32,
+    n_rows: u32,
+    b_blocks: u32,
+    k_beta: u32,
+    k_offset: u32,
+    idx_bits: u32,
+    has_offset: bool,
+    stream: *mut c_void,
+) -> Result<(), LeechDecodeError> {
+    init_tables()?;
+    if idx_bits != 48 && idx_bits != 54 {
+        return Err(LeechDecodeError::UnsupportedIdxBits(idx_bits));
+    }
+    unsafe {
+        leech_gemv_bf16_cuda(
+            a_act_bf16_ptr,
+            packed_stream,
+            beta_codebook_ptr,
+            offset_codebook_ptr,
+            out_y_bf16_ptr,
+            m,
+            n_rows,
+            b_blocks,
+            k_beta,
+            k_offset,
             idx_bits as std::os::raw::c_int,
             if has_offset { 1 } else { 0 },
             stream,

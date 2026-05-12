@@ -29,7 +29,9 @@ pub use leech_layer::LeechLayer;
 pub use leech_linear::{leech_linear, leech_linear_from_tensors};
 
 #[cfg(feature = "cuda")]
-pub use leech_cuda::{init_tables, leech_decode_v_int, LeechDecodeError};
+pub use leech_cuda::{
+    init_tables, leech_decode_bf16, leech_decode_v_int, leech_gemv_bf16, LeechDecodeError,
+};
 
 #[cfg(not(feature = "cuda"))]
 pub use leech_cpu::{init_tables, leech_decode_v_int, LeechDecodeError};

@@ -21,6 +21,8 @@
 // Ragged arrays (codewords, multisets) → __device__ (~12 MB at ms=18).
 
 #include <cstdint>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "leech_bit_extract.cuh"
 #include "leech_sign_unrank.cuh"
 #include "leech_multiset_unrank.cuh"
@@ -135,8 +137,8 @@ __device__ __forceinline__ int lookup_class(int m, int64_t I_shell) {
 // ──────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ void decode_even(
     int64_t i_local, int g,
-    int64_t* out_x, int64_t* perm_F0, int64_t* perm_F1, int64_t* abs_x,
-    int64_t* rem_scratch
+    int8_t* out_x, int8_t* perm_F0, int8_t* perm_F1, int8_t* abs_x,
+    int8_t* rem_scratch
 ) {
     int64_t A   = c_A[g];
     int64_t two_B = c_two_B[g];
@@ -191,8 +193,8 @@ __device__ __forceinline__ void decode_even(
     int f1_cursor = 0;
     for (int i = 0; i < 24; ++i) {
         int bit = (b >> i) & 1;
-        int64_t v_if_zero = perm_F0[f0_cursor];
-        int64_t v_if_one  = (w > 0) ? perm_F1[f1_cursor] : 0;
+        int8_t v_if_zero = perm_F0[f0_cursor];
+        int8_t v_if_one  = (w > 0) ? perm_F1[f1_cursor] : (int8_t)0;
         abs_x[i] = (bit == 1) ? v_if_one : v_if_zero;
         f0_cursor += (1 - bit);
         f1_cursor += bit;
@@ -210,13 +212,13 @@ __device__ __forceinline__ void decode_even(
     for (int i = 0; i < 24; ++i) out_x[i] = 0;
     int bit_idx = 0;
     for (int64_t vi_idx = nz_lo; vi_idx < nz_hi; ++vi_idx) {
-        int64_t vi = d_nz_flat[vi_idx];
+        int8_t vi = static_cast<int8_t>(d_nz_flat[vi_idx]);
         for (int i = 0; i < 24; ++i) {
-            int64_t match = (abs_x[i] == vi) ? 1 : 0;
-            int64_t sign = static_cast<int64_t>((sign_bits >> bit_idx) & 1ull) & match;
-            int64_t sign_factor = 2 * sign - 1;
-            out_x[i] += abs_x[i] * match * sign_factor;
-            bit_idx += static_cast<int>(match);
+            int match = (abs_x[i] == vi) ? 1 : 0;
+            int sign = static_cast<int>((sign_bits >> bit_idx) & 1ull) & match;
+            int sign_factor = 2 * sign - 1;
+            out_x[i] = static_cast<int8_t>(out_x[i] + abs_x[i] * match * sign_factor);
+            bit_idx += match;
         }
     }
 }
@@ -227,8 +229,8 @@ __device__ __forceinline__ void decode_even(
 // ──────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ void decode_odd(
     int64_t i_local, int g,
-    int64_t* out_x, int64_t* abs_x,
-    int64_t* rem_scratch
+    int8_t* out_x, int8_t* abs_x,
+    int8_t* rem_scratch
 ) {
     int64_t A = c_A[g];
     int64_t r       = i_local % A;
@@ -252,12 +254,12 @@ __device__ __forceinline__ void decode_odd(
 
     // Branchless XOR sign reconstruction (paper §3.3 step 4).
     for (int i = 0; i < 24; ++i) {
-        int64_t v = abs_x[i];
-        int64_t parity_low = (v >> 1) & 1;
-        int64_t b_bit = (b >> i) & 1;
-        int64_t sign_neg = parity_low ^ b_bit;
-        int64_t sign_factor = 1 - 2 * sign_neg;
-        out_x[i] = v * sign_factor;
+        int v = abs_x[i];
+        int parity_low = (v >> 1) & 1;
+        int b_bit = static_cast<int>((b >> i) & 1u);
+        int sign_neg = parity_low ^ b_bit;
+        int sign_factor = 1 - 2 * sign_neg;
+        out_x[i] = static_cast<int8_t>(v * sign_factor);
     }
 }
 
@@ -289,11 +291,11 @@ __global__ void leech_decode_v_int_kernel(
     int64_t i_local = I_shell - c_class_cum_offset[g];
 
     // 3. Parity dispatch.
-    int64_t out_x[24];
-    int64_t abs_x[24];
-    int64_t perm_F0[24];
-    int64_t perm_F1[24];
-    int64_t rem_scratch[8];
+    int8_t out_x[24];
+    int8_t abs_x[24];
+    int8_t perm_F0[24];
+    int8_t perm_F1[24];
+    int8_t rem_scratch[8];
 
     if (c_parity[g] == 0) {
         decode_even(i_local, g, out_x, perm_F0, perm_F1, abs_x, rem_scratch);
@@ -305,7 +307,228 @@ __global__ void leech_decode_v_int_kernel(
     int8_t* row_out = out_v_int + static_cast<size_t>(block_id) * 24;
     #pragma unroll
     for (int k = 0; k < 24; ++k) {
-        row_out[k] = static_cast<int8_t>(out_x[k]);
+        row_out[k] = out_x[k];
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Phase 4.0a kernel: decode + β·v + offset → bf16 weight tile.
+//
+// Eliminates the int8 HBM roundtrip from the Phase 3 path. Each thread:
+//   1. Extracts (i_global, beta_idx, offset_idx) from packed_stream
+//   2. Decodes the 24 int8 v_int values (same as Phase 3)
+//   3. Applies LOCKED epilogue: bf16 = RNE(fp32(β * v_int + offset))
+//   4. Writes 24 bf16 values to the output weight tile at [row, col_block*24..]
+//
+// Output layout: bf16[R, B*24] row-major, where (R, B*24) is the dequantized
+// weight matrix (excluding any leftover columns — caller concatenates those).
+// ──────────────────────────────────────────────────────────────────────────
+template<int IDX_BITS, int BETA_BITS, int OFFSET_BITS, bool HAS_OFFSET>
+__global__ void leech_decode_bf16_kernel(
+    const uint8_t*       __restrict__ packed_stream,
+    const __half*        __restrict__ beta_codebook,    // [R, K_beta]
+    const __half*        __restrict__ offset_codebook,  // [R, K_offset] or nullptr
+    __nv_bfloat16*       __restrict__ out_weight,       // [R, B*24] row-major
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t k_beta,
+    uint32_t k_offset
+) {
+    uint32_t block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n_blocks = r_rows * b_blocks;
+    if (block_id >= n_blocks) return;
+
+    uint32_t row_idx = block_id / b_blocks;
+    uint32_t col_block_idx = block_id - row_idx * b_blocks;
+
+    // 1. Extract i_global, beta_idx, offset_idx for this block.
+    uint64_t i_global;
+    uint32_t beta_idx;
+    uint32_t offset_idx;
+    unpack_block_indices<IDX_BITS, BETA_BITS, OFFSET_BITS>(
+        packed_stream, block_id, i_global, beta_idx, offset_idx);
+
+    // 2. Shell + class lookup.
+    int m = lookup_shell(i_global);
+    int64_t I_shell = static_cast<int64_t>(i_global - c_N_cumulative[m]);
+    int g = lookup_class(m, I_shell);
+    int64_t i_local = I_shell - c_class_cum_offset[g];
+
+    // 3. Decode 24 v_int values.
+    int8_t out_x[24];
+    int8_t abs_x[24];
+    int8_t perm_F0[24];
+    int8_t perm_F1[24];
+    int8_t rem_scratch[8];
+
+    if (c_parity[g] == 0) {
+        decode_even(i_local, g, out_x, perm_F0, perm_F1, abs_x, rem_scratch);
+    } else {
+        decode_odd(i_local, g, out_x, abs_x, rem_scratch);
+    }
+
+    // 4. Apply LOCKED epilogue per CUDA_KERNEL_SPEC §3.1:
+    //      w_fp32 = beta * v_int + offset
+    //      w_bf16 = RNE(w_fp32)
+    // β / offset come from per-row codebooks indexed by the block's beta_idx /
+    // offset_idx fields. fp16 → fp32 cast happens via __half2float.
+    float beta_f = __half2float(beta_codebook[row_idx * k_beta + beta_idx]);
+    float offset_f = 0.0f;
+    if constexpr (HAS_OFFSET) {
+        offset_f = __half2float(offset_codebook[row_idx * k_offset + offset_idx]);
+    }
+
+    size_t row_stride = static_cast<size_t>(b_blocks) * 24;
+    __nv_bfloat16* row_out =
+        out_weight + static_cast<size_t>(row_idx) * row_stride
+                   + static_cast<size_t>(col_block_idx) * 24;
+
+    #pragma unroll
+    for (int k = 0; k < 24; ++k) {
+        float v_f = beta_f * static_cast<float>(out_x[k]) + offset_f;
+        row_out[k] = __float2bfloat16_rn(v_f);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Phase 4.0b kernel: fused decode + β·v + offset + dot product → bf16 output.
+//
+// One thread = one (m_idx, n_idx) output element. Each thread walks all
+// b_blocks weight blocks for its assigned weight row, decoding each block,
+// applying the LOCKED epilogue, and accumulating the dot product against
+// activations from the m_idx-th batch row. No HBM roundtrip for decoded
+// weights — they live in registers/local-mem inside the thread.
+//
+// Layout:
+//   a:   [M, b_blocks*24]   bf16 activations (row-major)
+//   out: [M, N_rows]        bf16 output (row-major)
+//
+// Optimal at batch=1 (M=1): no decode redundancy across threads. At M>1, each
+// weight block is decoded M times (one per batch row) — wasteful, but Phase
+// 4.0a dequantize+matmul wins there once M >= ~16.
+// ──────────────────────────────────────────────────────────────────────────
+// Warp-cooperative GEMV: one warp produces one output element. 32 lanes
+// split the K-block range (each lane handles b_blocks/32 blocks). At the end,
+// the warp reduces partial sums via shfl_xor.
+//
+// 4 warps per CTA = 128 threads → 4 outputs per CTA. With N=12288, 3072 CTAs.
+// On 170 SMs with 8 CTAs/SM, ~2 waves. Plenty of parallelism for latency
+// hiding when the decode path stalls on __device__ table reads.
+//
+// Activations are staged once per CTA in shared memory so all 4 warps share
+// the same activation row.
+template<int IDX_BITS, int BETA_BITS, int OFFSET_BITS, bool HAS_OFFSET>
+__global__ void __launch_bounds__(128, 8) leech_gemv_bf16_kernel(
+    const __nv_bfloat16* __restrict__ a_act,         // [m, b_blocks*24]
+    const uint8_t*       __restrict__ packed_stream,
+    const __half*        __restrict__ beta_codebook, // [n_rows, k_beta]
+    const __half*        __restrict__ offset_codebook, // [n_rows, k_offset] or null
+    __nv_bfloat16*       __restrict__ out_y,         // [m, n_rows]
+    uint32_t m,
+    uint32_t n_rows,
+    uint32_t b_blocks,
+    uint32_t k_beta,
+    uint32_t k_offset
+) {
+    constexpr int WARPS_PER_CTA = 4;
+    constexpr int THREADS_PER_WARP = 32;
+    constexpr int THREADS_PER_CTA = WARPS_PER_CTA * THREADS_PER_WARP;
+
+    int warp_id = threadIdx.x / THREADS_PER_WARP;
+    int lane    = threadIdx.x % THREADS_PER_WARP;
+
+    uint32_t n_idx = blockIdx.x * WARPS_PER_CTA + warp_id;
+    uint32_t m_idx = blockIdx.y;
+    if (n_idx >= n_rows) return;
+
+    // Shared memory layout:
+    //   [0 .. K_TOTAL)                          bf16 activations (per CTA, one row)
+    //   [K_TOTAL .. K_TOTAL + WARPS*K_CB)       fp32 beta codebook (per warp)
+    //   [next .. + WARPS*K_CB)                  fp32 offset codebook (per warp)
+    // K_CB caps at 8 (current encoder K_beta = K_offset = 8). Stored as fp32
+    // so the hot inner loop reads register-cheap floats.
+    constexpr int K_CB_MAX = 8;
+    extern __shared__ __nv_bfloat16 a_smem[];
+    uint32_t k_total = b_blocks * 24;
+    size_t a_stride = static_cast<size_t>(b_blocks) * 24;
+    const __nv_bfloat16* a_row = a_act + static_cast<size_t>(m_idx) * a_stride;
+
+    // Cooperative bulk load: each thread strides every THREADS_PER_CTA-th elt.
+    for (uint32_t i = threadIdx.x; i < k_total; i += THREADS_PER_CTA) {
+        a_smem[i] = a_row[i];
+    }
+
+    // Per-warp codebook caches (fp32) live in shared right after the act row.
+    float* beta_smem = reinterpret_cast<float*>(a_smem + k_total);
+    float* offset_smem = beta_smem + WARPS_PER_CTA * K_CB_MAX;
+    if (lane < (int)k_beta) {
+        beta_smem[warp_id * K_CB_MAX + lane] =
+            __half2float(beta_codebook[n_idx * k_beta + lane]);
+    }
+    if constexpr (HAS_OFFSET) {
+        if (lane < (int)k_offset) {
+            offset_smem[warp_id * K_CB_MAX + lane] =
+                __half2float(offset_codebook[n_idx * k_offset + lane]);
+        }
+    }
+    __syncthreads();
+    const float* beta_row = beta_smem + warp_id * K_CB_MAX;
+    const float* offset_row = offset_smem + warp_id * K_CB_MAX;
+
+    int8_t out_x[24];
+    int8_t abs_x[24];
+    int8_t perm_F0[24];
+    int8_t perm_F1[24];
+    int8_t rem_scratch[8];
+
+    float partial = 0.0f;
+
+    // Each lane handles every WARP_SIZE-th k_block of this warp's output row.
+    for (uint32_t k_block = lane; k_block < b_blocks; k_block += THREADS_PER_WARP) {
+        uint32_t block_id = n_idx * b_blocks + k_block;
+
+        uint64_t i_global;
+        uint32_t beta_idx;
+        uint32_t offset_idx;
+        leech::unpack_block_indices<IDX_BITS, BETA_BITS, OFFSET_BITS>(
+            packed_stream, block_id, i_global, beta_idx, offset_idx);
+
+        int m_shell = leech::lookup_shell(i_global);
+        int64_t I_shell = static_cast<int64_t>(i_global - leech::c_N_cumulative[m_shell]);
+        int g = leech::lookup_class(m_shell, I_shell);
+        int64_t i_local = I_shell - leech::c_class_cum_offset[g];
+
+        if (leech::c_parity[g] == 0) {
+            leech::decode_even(i_local, g, out_x, perm_F0, perm_F1, abs_x, rem_scratch);
+        } else {
+            leech::decode_odd(i_local, g, out_x, abs_x, rem_scratch);
+        }
+
+        float beta_f = beta_row[beta_idx];
+        float offset_f = 0.0f;
+        if constexpr (HAS_OFFSET) {
+            offset_f = offset_row[offset_idx];
+        }
+
+        const __nv_bfloat16* a_slice = a_smem + static_cast<size_t>(k_block) * 24;
+        #pragma unroll
+        for (int k = 0; k < 24; ++k) {
+            float w_f = beta_f * static_cast<float>(out_x[k]) + offset_f;
+            __nv_bfloat16 w_bf = __float2bfloat16_rn(w_f);
+            float w_back = __bfloat162float(w_bf);
+            float a_f = __bfloat162float(a_slice[k]);
+            partial += a_f * w_back;
+        }
+    }
+
+    // Warp reduction via butterfly shuffle.
+    #pragma unroll
+    for (int offset_s = 16; offset_s > 0; offset_s /= 2) {
+        partial += __shfl_xor_sync(0xffffffffu, partial, offset_s);
+    }
+
+    if (lane == 0) {
+        out_y[m_idx * n_rows + n_idx] = __float2bfloat16_rn(partial);
     }
 }
 
@@ -356,6 +579,108 @@ void leech_decode_v_int_cuda(
             packed_stream, out_v_int, n_blocks);
     }
     // Other idx_bits values: silently skipped. Phase 4 adds full dispatch.
+}
+
+// Phase 4.0a entry point: decode + β·v + offset → bf16 weight tile.
+//
+// Caller responsibilities (same as decode-only, plus codebooks):
+//   1. Call leech_init_tables_ffi() once per process.
+//   2. packed_stream tail-padded by ≥ 8 bytes.
+//   3. beta_codebook/offset_codebook are R * K_beta / R * K_offset fp16 entries.
+//   4. out_weight is sized R * B * 24 bf16 entries (= 2 * R * B * 24 bytes).
+//
+// ms=18 → idx_bits=54; ms=13 → idx_bits=48. Same {IDX_BITS, HAS_OFFSET}
+// dispatch matrix as the decode-only launcher.
+void leech_decode_bf16_cuda(
+    const uint8_t* packed_stream,
+    const void*    beta_codebook,
+    const void*    offset_codebook,
+    void*          out_weight_bf16,
+    uint32_t       r_rows,
+    uint32_t       b_blocks,
+    uint32_t       k_beta,
+    uint32_t       k_offset,
+    int            idx_bits,
+    int            has_offset,
+    cudaStream_t   stream
+) {
+    constexpr int BLOCK = 128;
+    uint32_t n_blocks = r_rows * b_blocks;
+    uint32_t grid = (n_blocks + BLOCK - 1) / BLOCK;
+
+    const __half* beta_h   = reinterpret_cast<const __half*>(beta_codebook);
+    const __half* offset_h = reinterpret_cast<const __half*>(offset_codebook);
+    __nv_bfloat16* out_bf  = reinterpret_cast<__nv_bfloat16*>(out_weight_bf16);
+
+    if (idx_bits == 54 && has_offset) {
+        leech::leech_decode_bf16_kernel<54, 3, 3, true>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, beta_h, offset_h, out_bf,
+                                          r_rows, b_blocks, k_beta, k_offset);
+    } else if (idx_bits == 54 && !has_offset) {
+        leech::leech_decode_bf16_kernel<54, 3, 0, false>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, beta_h, nullptr, out_bf,
+                                          r_rows, b_blocks, k_beta, 0);
+    } else if (idx_bits == 48 && has_offset) {
+        leech::leech_decode_bf16_kernel<48, 3, 3, true>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, beta_h, offset_h, out_bf,
+                                          r_rows, b_blocks, k_beta, k_offset);
+    } else if (idx_bits == 48 && !has_offset) {
+        leech::leech_decode_bf16_kernel<48, 3, 0, false>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, beta_h, nullptr, out_bf,
+                                          r_rows, b_blocks, k_beta, 0);
+    }
+}
+
+// Phase 4.0b: fused decode + epilogue + GEMV (no decoded-weight HBM roundtrip).
+//
+// Best at batch=1; degrades to M-fold redundant decode at large M.
+void leech_gemv_bf16_cuda(
+    const void*    a_act_bf16,      // [m, b_blocks*24] bf16
+    const uint8_t* packed_stream,
+    const void*    beta_codebook,   // fp16
+    const void*    offset_codebook, // fp16 or null
+    void*          out_y_bf16,      // [m, n_rows] bf16
+    uint32_t       m,
+    uint32_t       n_rows,
+    uint32_t       b_blocks,
+    uint32_t       k_beta,
+    uint32_t       k_offset,
+    int            idx_bits,
+    int            has_offset,
+    cudaStream_t   stream
+) {
+    // 1 warp = 1 output, 4 warps/CTA → 4 outputs/CTA.
+    constexpr int WARPS_PER_CTA = 4;
+    constexpr int THREADS_PER_CTA = WARPS_PER_CTA * 32;
+    constexpr int K_CB_MAX = 8;
+    uint32_t n_chunks = (n_rows + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
+    dim3 grid(n_chunks, m, 1);
+    dim3 block(THREADS_PER_CTA, 1, 1);
+    uint32_t smem_bytes = b_blocks * 24 * sizeof(__nv_bfloat16)
+                        + WARPS_PER_CTA * K_CB_MAX * sizeof(float) * 2;
+
+    const __nv_bfloat16* a_h  = reinterpret_cast<const __nv_bfloat16*>(a_act_bf16);
+    const __half*        b_h  = reinterpret_cast<const __half*>(beta_codebook);
+    const __half*        o_h  = reinterpret_cast<const __half*>(offset_codebook);
+    __nv_bfloat16*       y_h  = reinterpret_cast<__nv_bfloat16*>(out_y_bf16);
+
+    if (idx_bits == 54 && has_offset) {
+        leech::leech_gemv_bf16_kernel<54, 3, 3, true>
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, o_h, y_h,
+                                          m, n_rows, b_blocks, k_beta, k_offset);
+    } else if (idx_bits == 54 && !has_offset) {
+        leech::leech_gemv_bf16_kernel<54, 3, 0, false>
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, nullptr, y_h,
+                                          m, n_rows, b_blocks, k_beta, 0);
+    } else if (idx_bits == 48 && has_offset) {
+        leech::leech_gemv_bf16_kernel<48, 3, 3, true>
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, o_h, y_h,
+                                          m, n_rows, b_blocks, k_beta, k_offset);
+    } else if (idx_bits == 48 && !has_offset) {
+        leech::leech_gemv_bf16_kernel<48, 3, 0, false>
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, nullptr, y_h,
+                                          m, n_rows, b_blocks, k_beta, 0);
+    }
 }
 
 }  // extern "C"

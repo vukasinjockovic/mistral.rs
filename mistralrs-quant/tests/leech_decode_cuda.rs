@@ -139,7 +139,11 @@ fn decode_v_int_matches_cpu_reference() {
         let mut padded = Vec::with_capacity(payload.packed_stream.len() + 8);
         padded.extend_from_slice(payload.packed_stream);
         padded.extend_from_slice(&[0u8; 8]);
-        let d_packed = cuda.htod_copy(padded).expect("htod_copy packed_stream");
+        let mut d_packed = unsafe {
+            cuda.alloc::<u8>(padded.len()).expect("alloc d_packed")
+        };
+        cuda.memcpy_htod(&padded, &mut d_packed)
+            .expect("htod_copy packed_stream");
 
         // Allocate output.
         let out_len = (n_blocks as usize) * 24;
@@ -148,29 +152,34 @@ fn decode_v_int_matches_cpu_reference() {
             .expect("alloc_zeros out_v_int");
 
         // Cast device pointers and call the kernel.
+        let stream = cuda.cuda_stream();
         unsafe {
             use candle_core::cuda::cudarc::driver::DevicePtr;
-            let packed_ptr = *d_packed.device_ptr() as *const u8;
-            let out_ptr = *d_out.device_ptr() as *mut i8;
-            let stream = cuda.cu_stream() as *mut c_void;
+            let (packed_ptr, _packed_guard) = d_packed.device_ptr(&stream);
+            let (out_ptr, _out_guard) = d_out.device_ptr(&stream);
+            let stream_raw = stream.cu_stream() as *mut c_void;
             // Build slices for the safe wrapper.
-            let packed_slice =
-                std::slice::from_raw_parts(packed_ptr, padded_packed_len(&payload, &mt));
-            let out_slice = std::slice::from_raw_parts_mut(out_ptr, out_len);
+            let packed_slice = std::slice::from_raw_parts(
+                packed_ptr as *const u8,
+                padded_packed_len(&payload, &mt),
+            );
+            let out_slice = std::slice::from_raw_parts_mut(out_ptr as *mut i8, out_len);
             leech_decode_v_int(
                 packed_slice,
                 out_slice,
                 n_blocks as u32,
                 payload.idx_bits as u32,
                 payload.has_offset,
-                stream,
+                stream_raw,
             )
             .expect("leech_decode_v_int");
         }
-        cuda.synchronize().expect("cuda synchronize");
+        device.synchronize().expect("cuda synchronize");
 
         // Copy result back and diff.
-        let host_out: Vec<i8> = cuda.dtoh_sync_copy(&d_out).expect("dtoh_sync_copy");
+        let mut host_out: Vec<i8> = vec![0i8; out_len];
+        cuda.memcpy_dtoh(&d_out, &mut host_out)
+            .expect("memcpy_dtoh");
         let ref_i8: &[i8] = unsafe {
             std::slice::from_raw_parts(ref_bytes.as_ptr() as *const i8, ref_bytes.len())
         };
@@ -224,4 +233,111 @@ fn decode_v_int_matches_cpu_reference() {
 /// the 8B tail-pad. The slice we hand the kernel must be at least this big.
 fn padded_packed_len(payload: &mistralrs_leech::LlvqPayload<'_>, _mt: &ManifestTensor) -> usize {
     payload.packed_stream.len() + 8
+}
+
+/// Microbench: measure kernel-only execution time on one representative tensor.
+/// Setup (htod, alloc) happens once; we time N kernel iterations under a single
+/// sync. Skips unless LEECH_BENCH=1 is set.
+#[test]
+fn bench_decode_v_int_kernel_only() {
+    if std::env::var("LEECH_BENCH").is_err() {
+        eprintln!("LEECH_BENCH not set — skipping microbench");
+        return;
+    }
+    let Some(leech_path) = fixture_path() else {
+        eprintln!("LEECH_FIXTURE missing — skipping");
+        return;
+    };
+
+    let leech = LeechFile::open(&leech_path).expect("open .leech");
+    // Pick a large MLP tensor — high block count, exercises IDX_BITS=54 path.
+    let target = "model.language_model.layers.0.mlp.up_proj.weight";
+    let toc_idx = leech
+        .toc()
+        .iter()
+        .position(|e| e.name == target)
+        .expect("target tensor in TOC");
+    let entry = &leech.toc()[toc_idx];
+    let payload = leech.parse_llvq_payload(toc_idx).expect("parse_llvq_payload");
+    let n_blocks = payload.r as u64 * payload.b as u64;
+
+    let device = Device::new_cuda(0).expect("acquire CUDA device 0");
+    let cuda = device.as_cuda_device().expect("Device::Cuda");
+
+    let mut padded = Vec::with_capacity(payload.packed_stream.len() + 8);
+    padded.extend_from_slice(payload.packed_stream);
+    padded.extend_from_slice(&[0u8; 8]);
+    let mut d_packed = unsafe { cuda.alloc::<u8>(padded.len()).expect("alloc") };
+    cuda.memcpy_htod(&padded, &mut d_packed).expect("htod");
+    let out_len = (n_blocks as usize) * 24;
+    let d_out = cuda.alloc_zeros::<i8>(out_len).expect("alloc_zeros");
+
+    let warmup = std::env::var("LEECH_BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(10);
+    let iters = std::env::var("LEECH_BENCH_ITERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(200);
+
+    let stream = cuda.cuda_stream();
+    let packed_len = payload.packed_stream.len() + 8;
+
+    unsafe {
+        use candle_core::cuda::cudarc::driver::DevicePtr;
+        let (packed_ptr, _g1) = d_packed.device_ptr(&stream);
+        let (out_ptr, _g2) = d_out.device_ptr(&stream);
+        let stream_raw = stream.cu_stream() as *mut c_void;
+        let packed_slice = std::slice::from_raw_parts(packed_ptr as *const u8, packed_len);
+        let out_slice = std::slice::from_raw_parts_mut(out_ptr as *mut i8, out_len);
+
+        // Warmup.
+        for _ in 0..warmup {
+            leech_decode_v_int(
+                packed_slice,
+                out_slice,
+                n_blocks as u32,
+                payload.idx_bits as u32,
+                payload.has_offset,
+                stream_raw,
+            )
+            .expect("kernel");
+        }
+        device.synchronize().expect("sync after warmup");
+
+        // Timed loop.
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            leech_decode_v_int(
+                packed_slice,
+                out_slice,
+                n_blocks as u32,
+                payload.idx_bits as u32,
+                payload.has_offset,
+                stream_raw,
+            )
+            .expect("kernel");
+        }
+        device.synchronize().expect("sync after bench");
+        let elapsed = t0.elapsed();
+
+        let per_call_us = elapsed.as_secs_f64() * 1_000_000.0 / iters as f64;
+        let blocks_per_sec = (n_blocks as f64 * iters as f64) / elapsed.as_secs_f64();
+        let elements_per_sec = blocks_per_sec * 24.0;
+        let bytes_in_per_sec = (packed_len as f64 * iters as f64) / elapsed.as_secs_f64();
+        let bytes_out_per_sec = (out_len as f64 * iters as f64) / elapsed.as_secs_f64();
+        eprintln!();
+        eprintln!("=== BENCH: leech_decode_v_int kernel-only ===");
+        eprintln!("  tensor:        {}", entry.name);
+        eprintln!("  R={}  B={}  blocks={}  idx_bits={}  has_offset={}",
+            payload.r, payload.b, n_blocks, payload.idx_bits, payload.has_offset);
+        eprintln!("  warmup:        {} calls", warmup);
+        eprintln!("  iters:         {} calls", iters);
+        eprintln!("  per-call:      {:.1} µs", per_call_us);
+        eprintln!("  blocks/sec:    {:.3e}", blocks_per_sec);
+        eprintln!("  int8 elt/sec:  {:.3e}", elements_per_sec);
+        eprintln!("  packed in B/s: {:.3} GB/s", bytes_in_per_sec / 1e9);
+        eprintln!("  out B/s:       {:.3} GB/s", bytes_out_per_sec / 1e9);
+    }
 }

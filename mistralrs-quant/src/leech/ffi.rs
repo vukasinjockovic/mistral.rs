@@ -32,4 +32,57 @@ extern "C" {
         has_offset: c_int,
         stream: *mut c_void, // cudaStream_t — opaque to Rust
     );
+
+    /// Phase 4.0a: decode + β·v + offset → bf16 weight tile.
+    ///
+    /// One kernel that combines the Phase 3 decode with the LOCKED epilogue
+    /// `bf16 = RNE(fp32(β * v_int + offset))`. Eliminates the int8 HBM
+    /// roundtrip from the Phase 3 path (used by `dequantize_w`).
+    ///
+    /// # Args
+    /// - `packed_stream`: device, tail-padded by ≥ 8 bytes.
+    /// - `beta_codebook`: device, `R * K_beta` fp16 entries.
+    /// - `offset_codebook`: device, `R * K_offset` fp16 entries; pass null if
+    ///   `has_offset == 0`.
+    /// - `out_weight_bf16`: device, `R * B * 24` bf16 entries.
+    /// - `r_rows`: row count of the decoded weight matrix.
+    /// - `b_blocks`: LLVQ blocks per row.
+    /// - `k_beta`: β codebook entries per row (typically 8).
+    /// - `k_offset`: offset codebook entries per row (0 or 8).
+    /// - `idx_bits`: 48 (ms=13) or 54 (ms=18).
+    /// - `has_offset`: 0 or 1.
+    /// - `stream`: cudaStream_t. Pass null for the default stream.
+    pub(crate) fn leech_decode_bf16_cuda(
+        packed_stream: *const u8,
+        beta_codebook: *const c_void,
+        offset_codebook: *const c_void,
+        out_weight_bf16: *mut c_void,
+        r_rows: u32,
+        b_blocks: u32,
+        k_beta: u32,
+        k_offset: u32,
+        idx_bits: c_int,
+        has_offset: c_int,
+        stream: *mut c_void,
+    );
+
+    /// Phase 4.0b: fused decode + β·v + offset + GEMV → bf16 output. No HBM
+    /// roundtrip for decoded weights. Best at batch=1 generation. M-fold
+    /// redundant decode at large M — use `leech_decode_bf16_cuda` +
+    /// candle matmul for prefill / batch >= ~16.
+    pub(crate) fn leech_gemv_bf16_cuda(
+        a_act_bf16: *const c_void,
+        packed_stream: *const u8,
+        beta_codebook: *const c_void,
+        offset_codebook: *const c_void,
+        out_y_bf16: *mut c_void,
+        m: u32,
+        n_rows: u32,
+        b_blocks: u32,
+        k_beta: u32,
+        k_offset: u32,
+        idx_bits: c_int,
+        has_offset: c_int,
+        stream: *mut c_void,
+    );
 }
