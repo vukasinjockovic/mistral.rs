@@ -56,16 +56,20 @@ __constant__ uint8_t  c_T[ltab::N_CLASSES];
 // ──────────────────────────────────────────────────────────────────────────
 __device__ uint32_t d_codewords_flat[sizeof(ltab::codewords_flat) / sizeof(uint32_t)];
 __device__ int64_t  d_codewords_ofs [sizeof(ltab::codewords_ofs)  / sizeof(int64_t)];
-__device__ int64_t  d_f0_dist_flat  [sizeof(ltab::f0_distinct_flat) / sizeof(int64_t)];
+// Attack vector #4: distinct/counts/nz arrays narrowed to 8-bit. Values are
+// Leech-lattice coords (|v| ≤ 32) and counts (≤ 24), so they fit in int8/uint8.
+// 8x smaller storage → 8x more L1/L2 cache fit. The _ofs arrays stay int64
+// because they index into millions of elements.
+__device__ int8_t   d_f0_dist_flat  [sizeof(ltab::f0_distinct_flat) / sizeof(int8_t)];
 __device__ int64_t  d_f0_dist_ofs   [sizeof(ltab::f0_distinct_ofs)  / sizeof(int64_t)];
-__device__ int64_t  d_f0_cnt_flat   [sizeof(ltab::f0_counts_flat)   / sizeof(int64_t)];
-__device__ int64_t  d_f1_dist_flat  [sizeof(ltab::f1_distinct_flat) / sizeof(int64_t)];
+__device__ uint8_t  d_f0_cnt_flat   [sizeof(ltab::f0_counts_flat)   / sizeof(uint8_t)];
+__device__ int8_t   d_f1_dist_flat  [sizeof(ltab::f1_distinct_flat) / sizeof(int8_t)];
 __device__ int64_t  d_f1_dist_ofs   [sizeof(ltab::f1_distinct_ofs)  / sizeof(int64_t)];
-__device__ int64_t  d_f1_cnt_flat   [sizeof(ltab::f1_counts_flat)   / sizeof(int64_t)];
-__device__ int64_t  d_multi_dist_flat[sizeof(ltab::multiset_distinct_flat)/sizeof(int64_t)];
+__device__ uint8_t  d_f1_cnt_flat   [sizeof(ltab::f1_counts_flat)   / sizeof(uint8_t)];
+__device__ int8_t   d_multi_dist_flat[sizeof(ltab::multiset_distinct_flat)/sizeof(int8_t)];
 __device__ int64_t  d_multi_ofs     [sizeof(ltab::multi_ofs)         / sizeof(int64_t)];
-__device__ int64_t  d_multi_cnt_flat[sizeof(ltab::multiset_counts_flat)/sizeof(int64_t)];
-__device__ int64_t  d_nz_flat       [sizeof(ltab::nz_distinct_desc_flat)/sizeof(int64_t)];
+__device__ uint8_t  d_multi_cnt_flat[sizeof(ltab::multiset_counts_flat)/sizeof(uint8_t)];
+__device__ int8_t   d_nz_flat       [sizeof(ltab::nz_distinct_desc_flat)/sizeof(int8_t)];
 __device__ int64_t  d_nz_ofs        [sizeof(ltab::nz_ofs)            / sizeof(int64_t)];
 
 // One-shot host-side initializer. The host caller copies the constexpr data

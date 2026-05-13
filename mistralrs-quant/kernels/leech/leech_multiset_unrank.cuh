@@ -43,14 +43,13 @@ __device__ __forceinline__ int64_t perms_rem_k(
     return result;
 }
 
-// Unrank into out[0..n]. dist_vals/counts are int64 device-resident tables;
-// out and rem_scratch are int8 caller scratch (values fit — Leech lattice
-// coords are bounded by ±32 and counts by 24). This 8x reduction in scratch
-// type avoids local-memory spill on the per-thread scratch arrays.
+// Unrank into out[0..n]. dist_vals (int8) and counts (uint8) are narrowed
+// device-resident tables (attack vector #4); out and rem_scratch are int8
+// caller scratch. Values fit: Leech-lattice coords |v| ≤ 32, counts ≤ 24.
 __device__ __forceinline__ void unrank_multiset(
     int64_t  rank,
-    const int64_t* dist_vals,
-    const int64_t* counts,
+    const int8_t*  dist_vals,
+    const uint8_t* counts,
     int      k,
     int      n,
     int8_t*  out,
@@ -65,7 +64,7 @@ __device__ __forceinline__ void unrank_multiset(
             rem_scratch[j] = static_cast<int8_t>(cnt - avail);
             int64_t block = (avail == 1) ? perms_rem_k(rem_scratch, k, n - i - 1) : 0;
             if (avail == 1 && r < block) {
-                out[i] = static_cast<int8_t>(dist_vals[j]);
+                out[i] = dist_vals[j];
                 // mark break: keep rem_scratch[j] decremented and exit j-loop
                 goto next_i;
             }
