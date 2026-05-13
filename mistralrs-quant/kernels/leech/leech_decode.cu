@@ -74,7 +74,6 @@ __device__ int64_t  d_nz_ofs        [sizeof(ltab::nz_ofs)            / sizeof(in
 // Declared inline-friendly so the Rust FFI side can drive it without a
 // separate .cu file.
 __host__ inline void leech_init_tables() {
-    // Precompute and upload the 25x25 binomial table once per process.
     {
         int64_t host_binom[25][25];
         for (int n = 0; n < 25; ++n) {
@@ -128,14 +127,6 @@ __device__ __forceinline__ int lookup_shell(uint64_t i_global) {
     return ltab::MS_MAX;  // shouldn't reach
 }
 
-// Binary search over the (shell, class) cumulative offset array — finds the
-// unique class index g in [sc_start, sc_start + sc_count) such that
-//   c_class_cum_offset[g] ≤ I_shell < c_class_cum_offset[g+1]
-// (with c_class_cum_offset[sc_start + sc_count] := shell_total implicit).
-//
-// Linear scan was O(sc_count) ≈ 50-100 per decode at ms=18. Binary search is
-// O(log sc_count) ≈ 7. The c_class_cum_offset array is sorted-ascending by
-// construction (it's a cumulative count), so binary search is valid.
 __device__ __forceinline__ int lookup_class(int m, int64_t I_shell) {
     int sc_start = c_shell_class_start[m];
     int sc_count = c_shell_class_count[m];
@@ -161,8 +152,8 @@ __device__ __forceinline__ int lookup_class(int m, int64_t I_shell) {
 // ──────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ void decode_even(
     int64_t i_local, int g,
-    uint32_t* out_x_pk, uint32_t* perm_F0_pk, uint32_t* perm_F1_pk, uint32_t* abs_x_pk,
-    uint32_t* rem_pk
+    int8_t* out_x, int8_t* perm_F0, int8_t* perm_F1, int8_t* abs_x,
+    int8_t* rem_scratch
 ) {
     int64_t A   = c_A[g];
     int64_t two_B = c_two_B[g];
@@ -179,63 +170,69 @@ __device__ __forceinline__ void decode_even(
     uint32_t b = d_codewords_flat[cw_lo + r];
     int w = popcount24(b);
 
+    // F_0 placement: 24 - w slots
     int n_f0 = 24 - w;
-    #pragma unroll
-    for (int i = 0; i < 6; ++i) perm_F0_pk[i] = 0;
+    for (int i = 0; i < 24; ++i) perm_F0[i] = 0;
     if (n_f0 > 0) {
         int64_t f0_lo = d_f0_dist_ofs[g];
         int64_t f0_hi = d_f0_dist_ofs[g + 1];
         int k = static_cast<int>(f0_hi - f0_lo);
-        unrank_multiset(rank_F0,
-                        d_f0_dist_flat + f0_lo,
-                        d_f0_cnt_flat  + f0_lo,
-                        k, n_f0,
-                        perm_F0_pk, rem_pk);
+        unrank_multiset(
+            rank_F0,
+            d_f0_dist_flat + f0_lo,
+            d_f0_cnt_flat  + f0_lo,
+            k, n_f0,
+            perm_F0,
+            rem_scratch
+        );
     }
 
-    #pragma unroll
-    for (int i = 0; i < 6; ++i) perm_F1_pk[i] = 0;
+    // F_1 placement: w slots
+    for (int i = 0; i < 24; ++i) perm_F1[i] = 0;
     if (w > 0) {
         int64_t f1_lo = d_f1_dist_ofs[g];
         int64_t f1_hi = d_f1_dist_ofs[g + 1];
         int k = static_cast<int>(f1_hi - f1_lo);
-        unrank_multiset(rank_F1,
-                        d_f1_dist_flat + f1_lo,
-                        d_f1_cnt_flat  + f1_lo,
-                        k, w,
-                        perm_F1_pk, rem_pk);
+        unrank_multiset(
+            rank_F1,
+            d_f1_dist_flat + f1_lo,
+            d_f1_cnt_flat  + f1_lo,
+            k, w,
+            perm_F1,
+            rem_scratch
+        );
     }
 
-    // Bit-interleave perm_F0/F1 into abs_x by codeword bits.
+    // Interleave abs_x by codeword bits (branchless multiplex).
     int f0_cursor = 0;
     int f1_cursor = 0;
     for (int i = 0; i < 24; ++i) {
         int bit = (b >> i) & 1;
-        int v_if_zero = static_cast<int>(pk_get(perm_F0_pk, f0_cursor));
-        int v_if_one  = (w > 0) ? static_cast<int>(pk_get(perm_F1_pk, f1_cursor)) : 0;
-        pk_set(abs_x_pk, i, (bit == 1) ? v_if_one : v_if_zero);
+        int8_t v_if_zero = perm_F0[f0_cursor];
+        int8_t v_if_one  = (w > 0) ? perm_F1[f1_cursor] : (int8_t)0;
+        abs_x[i] = (bit == 1) ? v_if_one : v_if_zero;
         f0_cursor += (1 - bit);
         f1_cursor += bit;
     }
 
+    // Algebraic sign reconstruction. No table lookup.
     uint64_t sign_bits = even_sign_unrank(
         static_cast<uint64_t>(s_idx),
-        c_V2_mask[g], c_dep_bit[g], c_T[g]);
-
+        c_V2_mask[g],
+        c_dep_bit[g],
+        c_T[g]
+    );
     int64_t nz_lo = d_nz_ofs[g];
     int64_t nz_hi = d_nz_ofs[g + 1];
-    #pragma unroll
-    for (int i = 0; i < 6; ++i) out_x_pk[i] = 0;
+    for (int i = 0; i < 24; ++i) out_x[i] = 0;
     int bit_idx = 0;
     for (int64_t vi_idx = nz_lo; vi_idx < nz_hi; ++vi_idx) {
-        int vi = static_cast<int8_t>(d_nz_flat[vi_idx]);
+        int8_t vi = static_cast<int8_t>(d_nz_flat[vi_idx]);
         for (int i = 0; i < 24; ++i) {
-            int a_val = static_cast<int>(pk_get(abs_x_pk, i));
-            int match = (a_val == vi) ? 1 : 0;
+            int match = (abs_x[i] == vi) ? 1 : 0;
             int sign = static_cast<int>((sign_bits >> bit_idx) & 1ull) & match;
             int sign_factor = 2 * sign - 1;
-            int cur = static_cast<int>(static_cast<int8_t>(pk_get(out_x_pk, i)));
-            pk_set(out_x_pk, i, cur + a_val * match * sign_factor);
+            out_x[i] = static_cast<int8_t>(out_x[i] + abs_x[i] * match * sign_factor);
             bit_idx += match;
         }
     }
@@ -247,8 +244,8 @@ __device__ __forceinline__ void decode_even(
 // ──────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ void decode_odd(
     int64_t i_local, int g,
-    uint32_t* out_x_pk, uint32_t* abs_x_pk,
-    uint32_t* rem_pk
+    int8_t* out_x, int8_t* abs_x,
+    int8_t* rem_scratch
 ) {
     int64_t A = c_A[g];
     int64_t r       = i_local % A;
@@ -260,20 +257,24 @@ __device__ __forceinline__ void decode_odd(
     int64_t m_lo = d_multi_ofs[g];
     int64_t m_hi = d_multi_ofs[g + 1];
     int k = static_cast<int>(m_hi - m_lo);
-    #pragma unroll
-    for (int i = 0; i < 6; ++i) abs_x_pk[i] = 0;
-    unrank_multiset(I_perm,
-                    d_multi_dist_flat + m_lo,
-                    d_multi_cnt_flat  + m_lo,
-                    k, 24, abs_x_pk, rem_pk);
+    for (int i = 0; i < 24; ++i) abs_x[i] = 0;
+    unrank_multiset(
+        I_perm,
+        d_multi_dist_flat + m_lo,
+        d_multi_cnt_flat  + m_lo,
+        k, 24,
+        abs_x,
+        rem_scratch
+    );
 
+    // Branchless XOR sign reconstruction (paper §3.3 step 4).
     for (int i = 0; i < 24; ++i) {
-        int v = static_cast<int>(pk_get(abs_x_pk, i));
+        int v = abs_x[i];
         int parity_low = (v >> 1) & 1;
         int b_bit = static_cast<int>((b >> i) & 1u);
         int sign_neg = parity_low ^ b_bit;
         int sign_factor = 1 - 2 * sign_neg;
-        pk_set(out_x_pk, i, v * sign_factor);
+        out_x[i] = static_cast<int8_t>(v * sign_factor);
     }
 }
 
@@ -304,24 +305,24 @@ __global__ void leech_decode_v_int_kernel(
     int g = lookup_class(m, I_shell);
     int64_t i_local = I_shell - c_class_cum_offset[g];
 
-    // 3. Parity dispatch — packed scratch (6 uint32 per 24-byte array, in regs).
-    uint32_t out_x_pk[6];
-    uint32_t abs_x_pk[6];
-    uint32_t perm_F0_pk[6];
-    uint32_t perm_F1_pk[6];
-    uint32_t rem_pk[2];
+    // 3. Parity dispatch.
+    int8_t out_x[24];
+    int8_t abs_x[24];
+    int8_t perm_F0[24];
+    int8_t perm_F1[24];
+    int8_t rem_scratch[8];
 
     if (c_parity[g] == 0) {
-        decode_even(i_local, g, out_x_pk, perm_F0_pk, perm_F1_pk, abs_x_pk, rem_pk);
+        decode_even(i_local, g, out_x, perm_F0, perm_F1, abs_x, rem_scratch);
     } else {
-        decode_odd(i_local, g, out_x_pk, abs_x_pk, rem_pk);
+        decode_odd(i_local, g, out_x, abs_x, rem_scratch);
     }
 
     // 4. Write 24 int8 values.
     int8_t* row_out = out_v_int + static_cast<size_t>(block_id) * 24;
     #pragma unroll
     for (int k = 0; k < 24; ++k) {
-        row_out[k] = pk_get(out_x_pk, k);
+        row_out[k] = out_x[k];
     }
 }
 
@@ -368,20 +369,24 @@ __global__ void leech_decode_bf16_kernel(
     int g = lookup_class(m, I_shell);
     int64_t i_local = I_shell - c_class_cum_offset[g];
 
-    // 3. Decode 24 v_int values — packed scratch (in registers, no spill).
-    uint32_t out_x_pk[6];
-    uint32_t abs_x_pk[6];
-    uint32_t perm_F0_pk[6];
-    uint32_t perm_F1_pk[6];
-    uint32_t rem_pk[2];
+    // 3. Decode 24 v_int values.
+    int8_t out_x[24];
+    int8_t abs_x[24];
+    int8_t perm_F0[24];
+    int8_t perm_F1[24];
+    int8_t rem_scratch[8];
 
     if (c_parity[g] == 0) {
-        decode_even(i_local, g, out_x_pk, perm_F0_pk, perm_F1_pk, abs_x_pk, rem_pk);
+        decode_even(i_local, g, out_x, perm_F0, perm_F1, abs_x, rem_scratch);
     } else {
-        decode_odd(i_local, g, out_x_pk, abs_x_pk, rem_pk);
+        decode_odd(i_local, g, out_x, abs_x, rem_scratch);
     }
 
-    // 4. LOCKED epilogue: bf16 = RNE(fp32(β * v_int + offset)).
+    // 4. Apply LOCKED epilogue per CUDA_KERNEL_SPEC §3.1:
+    //      w_fp32 = beta * v_int + offset
+    //      w_bf16 = RNE(w_fp32)
+    // β / offset come from per-row codebooks indexed by the block's beta_idx /
+    // offset_idx fields. fp16 → fp32 cast happens via __half2float.
     float beta_f = __half2float(beta_codebook[row_idx * k_beta + beta_idx]);
     float offset_f = 0.0f;
     if constexpr (HAS_OFFSET) {
@@ -395,8 +400,7 @@ __global__ void leech_decode_bf16_kernel(
 
     #pragma unroll
     for (int k = 0; k < 24; ++k) {
-        int8_t v_int = pk_get(out_x_pk, k);
-        float v_f = beta_f * static_cast<float>(v_int) + offset_f;
+        float v_f = beta_f * static_cast<float>(out_x[k]) + offset_f;
         row_out[k] = __float2bfloat16_rn(v_f);
     }
 }
@@ -452,16 +456,24 @@ __global__ void __launch_bounds__(128, 12) leech_gemv_bf16_kernel(
     uint32_t m_idx = blockIdx.y;
     if (n_idx >= n_rows) return;
 
+    // Shared memory layout:
+    //   [0 .. K_TOTAL)                          bf16 activations (per CTA, one row)
+    //   [K_TOTAL .. K_TOTAL + WARPS*K_CB)       fp32 beta codebook (per warp)
+    //   [next .. + WARPS*K_CB)                  fp32 offset codebook (per warp)
+    // K_CB caps at 8 (current encoder K_beta = K_offset = 8). Stored as fp32
+    // so the hot inner loop reads register-cheap floats.
     constexpr int K_CB_MAX = 8;
     extern __shared__ __nv_bfloat16 a_smem[];
     uint32_t k_total = b_blocks * 24;
     size_t a_stride = static_cast<size_t>(b_blocks) * 24;
     const __nv_bfloat16* a_row = a_act + static_cast<size_t>(m_idx) * a_stride;
 
+    // Cooperative bulk load: each thread strides every THREADS_PER_CTA-th elt.
     for (uint32_t i = threadIdx.x; i < k_total; i += THREADS_PER_CTA) {
         a_smem[i] = a_row[i];
     }
 
+    // Per-warp codebook caches (fp32) live in shared right after the act row.
     float* beta_smem = reinterpret_cast<float*>(a_smem + k_total);
     float* offset_smem = beta_smem + WARPS_PER_CTA * K_CB_MAX;
     if (lane < (int)k_beta) {
@@ -478,11 +490,11 @@ __global__ void __launch_bounds__(128, 12) leech_gemv_bf16_kernel(
     const float* beta_row = beta_smem + warp_id * K_CB_MAX;
     const float* offset_row = offset_smem + warp_id * K_CB_MAX;
 
-    uint32_t out_x_pk[6];
-    uint32_t abs_x_pk[6];
-    uint32_t perm_F0_pk[6];
-    uint32_t perm_F1_pk[6];
-    uint32_t rem_pk[2];
+    int8_t out_x[24];
+    int8_t abs_x[24];
+    int8_t perm_F0[24];
+    int8_t perm_F1[24];
+    int8_t rem_scratch[8];
 
     float partial = 0.0f;
 
@@ -502,9 +514,9 @@ __global__ void __launch_bounds__(128, 12) leech_gemv_bf16_kernel(
         int64_t i_local = I_shell - leech::c_class_cum_offset[g];
 
         if (leech::c_parity[g] == 0) {
-            leech::decode_even(i_local, g, out_x_pk, perm_F0_pk, perm_F1_pk, abs_x_pk, rem_pk);
+            leech::decode_even(i_local, g, out_x, perm_F0, perm_F1, abs_x, rem_scratch);
         } else {
-            leech::decode_odd(i_local, g, out_x_pk, abs_x_pk, rem_pk);
+            leech::decode_odd(i_local, g, out_x, abs_x, rem_scratch);
         }
 
         float beta_f = beta_row[beta_idx];
@@ -513,23 +525,14 @@ __global__ void __launch_bounds__(128, 12) leech_gemv_bf16_kernel(
             offset_f = offset_row[offset_idx];
         }
 
-        // Inline byte-extract: read each packed uint32 once, process 4 bytes
-        // from it. nvcc lowers byte extracts to PRMT (1 cycle) when the source
-        // word is in a register.
         const __nv_bfloat16* a_slice = a_smem + static_cast<size_t>(k_block) * 24;
         #pragma unroll
-        for (int word = 0; word < 6; ++word) {
-            uint32_t packed = out_x_pk[word];
-            #pragma unroll
-            for (int byte_idx = 0; byte_idx < 4; ++byte_idx) {
-                int k = word * 4 + byte_idx;
-                int8_t v_int = static_cast<int8_t>((packed >> (byte_idx * 8)) & 0xFFu);
-                float w_f = beta_f * static_cast<float>(v_int) + offset_f;
-                __nv_bfloat16 w_bf = __float2bfloat16_rn(w_f);
-                float w_back = __bfloat162float(w_bf);
-                float a_f = __bfloat162float(a_slice[k]);
-                partial += a_f * w_back;
-            }
+        for (int k = 0; k < 24; ++k) {
+            float w_f = beta_f * static_cast<float>(out_x[k]) + offset_f;
+            __nv_bfloat16 w_bf = __float2bfloat16_rn(w_f);
+            float w_back = __bfloat162float(w_bf);
+            float a_f = __bfloat162float(a_slice[k]);
+            partial += a_f * w_back;
         }
     }
 
