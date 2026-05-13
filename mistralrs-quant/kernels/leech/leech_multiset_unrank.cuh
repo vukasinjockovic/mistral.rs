@@ -33,6 +33,22 @@ __device__ __forceinline__ int64_t binom_small(int64_t n, int64_t k) {
     return c_binom_table[n][k];
 }
 
+// Vector #B: 5-step __popc binary search for the target-th set bit (0-indexed)
+// in a 24-bit mask. Replaces O(n) snapshot-scan in the lift loop.
+//
+// Returns smallest `pos` such that popcount(mask & ((1<<pos)-1)) > target.
+// Caller MUST ensure target < popcount(mask); behavior is undefined otherwise.
+__device__ __forceinline__ int nth_set_bit_24(uint32_t mask, int target) {
+    int lo = 0;
+    #pragma unroll
+    for (int step = 16; step >= 1; step >>= 1) {
+        int probe = lo + step;
+        int below = __popc(mask & ((1u << probe) - 1u));
+        lo = (below <= target) ? probe : lo;
+    }
+    return lo;
+}
+
 // Multinomial helper — retained for any caller still wanting it; unused by
 // combinadic unrank itself.
 __device__ __forceinline__ int64_t perms_rem_k(
@@ -107,18 +123,12 @@ __device__ __forceinline__ void unrank_multiset(
         }
 
         // Lift each reduced position to original via target-th set bit of
-        // snapshot, then clear that bit from the live free_mask.
-        int64_t snapshot = free_mask;
+        // snapshot, then clear that bit from the live free_mask. Vector #B:
+        // 5-step __popc binary search replaces O(n) snapshot-scan walk.
+        uint32_t snapshot = static_cast<uint32_t>(free_mask) & 0x00FFFFFFu;
         for (int t = 0; t < c_v; ++t) {
-            int target = static_cast<int>(reduced_pos[t]);
-            int count = 0;
-            int pos = -1;
-            for (int jj = 0; jj < n; ++jj) {
-                if ((snapshot >> jj) & static_cast<int64_t>(1)) {
-                    if (count == target) { pos = jj; break; }
-                    ++count;
-                }
-            }
+            int target = reduced_pos[t];
+            int pos = nth_set_bit_24(snapshot, target);
             out[pos] = dist_vals[v];
             free_mask &= ~(static_cast<int64_t>(1) << pos);
         }
