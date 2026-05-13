@@ -91,12 +91,9 @@ __device__ __forceinline__ void unrank_multiset(
 
         int64_t r_v = (rank / products[v + 1]) % sizes[v];
 
-        // n_avail = popcount(free_mask) via loop (no __popc — keep semantics
-        // verbatim from Python reference).
-        int n_avail = 0;
-        for (int j = 0; j < n; ++j) {
-            if ((free_mask >> j) & static_cast<int64_t>(1)) n_avail++;
-        }
+        // n_avail = popcount of low n bits of free_mask. Vector #A:
+        // single PTX popc vs 24-iter predicated-add loop.
+        int n_avail = __popc(static_cast<uint32_t>(free_mask) & 0x00FFFFFFu);
 
         // CNS decode r_v → c_v ascending reduced positions.
         int64_t r_rem = r_v;
