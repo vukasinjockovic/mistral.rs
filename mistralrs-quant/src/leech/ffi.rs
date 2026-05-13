@@ -75,12 +75,24 @@ extern "C" {
         packed_stream: *const u8,
         beta_codebook: *const c_void,
         offset_codebook: *const c_void,
+        parity_perm: *const c_void,
         out_y_bf16: *mut c_void,
         m: u32,
         n_rows: u32,
         b_blocks: u32,
         k_beta: u32,
         k_offset: u32,
+        idx_bits: c_int,
+        has_offset: c_int,
+        stream: *mut c_void,
+    );
+
+    /// Compute per-block decode parity (0=even, 1=odd). Used by host code to
+    /// build the parity-sort permutation passed to leech_gemv_bf16_cuda.
+    pub(crate) fn leech_compute_block_parity_cuda(
+        packed_stream: *const u8,
+        out_parity: *mut u8,
+        n_blocks: u32,
         idx_bits: c_int,
         has_offset: c_int,
         stream: *mut c_void,

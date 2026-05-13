@@ -53,6 +53,14 @@ pub struct LeechLayer {
     leftover_bf16: Option<Tensor>,
     /// Optional bias (bf16 / fp16).
     bias: Option<Tensor>,
+    /// Parity-sort permutation: `u16[rows * blocks_per_row]` device buffer.
+    /// For each row r, parity_perm[r * b_blocks .. (r+1) * b_blocks] lists
+    /// the k_block indices in parity-sorted order (all even-parity blocks
+    /// first, then odd). Eliminates warp divergence in the GEMV decode branch.
+    /// Lazily computed on first forward_raw call. Stored as a raw CudaSlice
+    /// because candle doesn't expose u16 as a tensor dtype.
+    #[cfg(feature = "cuda")]
+    parity_perm: std::sync::OnceLock<candle_core::cuda::cudarc::driver::CudaSlice<u16>>,
     /// Cached weight dtype/device for the QuantMethod trait.
     dtype: DType,
     device: Device,
@@ -118,6 +126,8 @@ impl QuantMethod for LeechLayer {
                     ms_used,
                     leftover_bf16,
                     bias,
+                    #[cfg(feature = "cuda")]
+                    parity_perm: std::sync::OnceLock::new(),
                     dtype,
                     device,
                 })
@@ -239,6 +249,86 @@ impl LeechLayer {
 
 #[cfg(feature = "cuda")]
 impl LeechLayer {
+    /// Lazily build the parity-sort permutation. Runs the compute_block_parity
+    /// kernel on the packed_stream to tag each block's parity, then on host
+    /// sorts each row's block indices so all even-parity blocks come first.
+    ///
+    /// Returns a device pointer to the u16 permutation tensor, or null if
+    /// construction failed (caller falls back to non-parity-sorted iteration).
+    fn parity_perm_device_ptr(&self) -> *const std::ffi::c_void {
+        use candle_core::cuda::cudarc::driver::DevicePtr;
+        use candle_core::Storage;
+        use std::ffi::c_void;
+
+        use crate::leech::leech_compute_block_parity;
+        use crate::utils::slice_ptr;
+
+        let cuda = match &self.device {
+            Device::Cuda(d) => d,
+            _ => return std::ptr::null(),
+        };
+
+        let perm_slice = self.parity_perm.get_or_init(|| {
+            let n_rows = self.rows as usize;
+            let b_blocks = self.blocks_per_row as usize;
+            let n_blocks = n_rows * b_blocks;
+
+            // 1. Compute per-block parity via CUDA kernel.
+            let parity_buf = cuda.alloc_zeros::<u8>(n_blocks).expect("alloc parity");
+            let stream = cuda.cuda_stream();
+            let stream_raw = stream.cu_stream() as *mut c_void;
+
+            let (ps_s, ps_l) = self.packed_stream.storage_and_layout();
+            let Storage::Cuda(ps_s) = &*ps_s else { panic!("packed_stream not CUDA") };
+            let ps_slice = ps_s.as_cuda_slice::<u8>().expect("u8 slice");
+            let (ps_ptr, _ps_guard) = slice_ptr(ps_slice, ps_l.start_offset());
+            let (par_ptr_u64, _par_guard) = parity_buf.device_ptr(&stream);
+
+            unsafe {
+                leech_compute_block_parity(
+                    ps_ptr as *const u8,
+                    par_ptr_u64 as *mut u8,
+                    n_blocks as u32,
+                    self.idx_bits as u32,
+                    self.has_offset,
+                    stream_raw,
+                )
+                .expect("compute_block_parity");
+            }
+            drop(_par_guard);
+            drop(_ps_guard);
+
+            // 2. Pull parity to host.
+            let mut parity_host: Vec<u8> = vec![0u8; n_blocks];
+            cuda.memcpy_dtoh(&parity_buf, &mut parity_host).expect("dtoh parity");
+
+            // 3. Build per-row permutation: evens first, then odds.
+            let mut perm_host: Vec<u16> = Vec::with_capacity(n_blocks);
+            for r in 0..n_rows {
+                let row_par = &parity_host[r * b_blocks..(r + 1) * b_blocks];
+                for (k, &p) in row_par.iter().enumerate() {
+                    if p == 0 {
+                        perm_host.push(k as u16);
+                    }
+                }
+                for (k, &p) in row_par.iter().enumerate() {
+                    if p == 1 {
+                        perm_host.push(k as u16);
+                    }
+                }
+            }
+
+            // 4. Upload to device.
+            let mut perm_dev = unsafe { cuda.alloc::<u16>(n_blocks).expect("alloc perm") };
+            cuda.memcpy_htod(&perm_host, &mut perm_dev).expect("htod perm");
+            perm_dev
+        });
+
+        let stream = cuda.cuda_stream();
+        let (ptr, _g) = perm_slice.device_ptr(&stream);
+        ptr as *const c_void
+    }
+
     /// Phase 4.0a dequantize: one kernel that decodes + applies the LOCKED
     /// epilogue `bf16 = RNE(fp32(β · v_int + offset))` into a contiguous
     /// `[rows, blocks_per_row * 24]` bf16 weight tensor. If `leftover_bf16` is
@@ -463,12 +553,14 @@ impl LeechLayer {
                 };
                 let oc_slice = oc_s.as_cuda_slice::<half::f16>()?;
                 let (offset_ptr_u64, _oc_guard) = slice_ptr(oc_slice, oc_l.start_offset());
+                let pp_ptr = self.parity_perm_device_ptr();
                 unsafe {
                     leech_gemv_bf16(
                         a_ptr as *const c_void,
                         ps_ptr as *const u8,
                         bc_ptr as *const c_void,
                         offset_ptr_u64 as *const c_void,
+                        pp_ptr,
                         out_ptr_u64 as *mut c_void,
                         m as u32,
                         n_rows,
@@ -484,12 +576,14 @@ impl LeechLayer {
                 drop(_oc_guard);
             }
             None => {
+                let pp_ptr = self.parity_perm_device_ptr();
                 unsafe {
                     leech_gemv_bf16(
                         a_ptr as *const c_void,
                         ps_ptr as *const u8,
                         bc_ptr as *const c_void,
                         std::ptr::null::<c_void>(),
+                        pp_ptr,
                         out_ptr_u64 as *mut c_void,
                         m as u32,
                         n_rows,

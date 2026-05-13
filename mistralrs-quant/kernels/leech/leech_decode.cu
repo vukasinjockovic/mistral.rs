@@ -406,6 +406,34 @@ __global__ void leech_decode_bf16_kernel(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Parity-tag kernel: for each block, output its decode parity (0=even, 1=odd).
+// Used by the layer-setup path to build a permutation that groups even blocks
+// before odd blocks per row — eliminates warp divergence in the GEMV kernel's
+// decode_even / decode_odd branch (Attack vector #1).
+// ──────────────────────────────────────────────────────────────────────────
+template<int IDX_BITS, int BETA_BITS, int OFFSET_BITS>
+__global__ void leech_block_parity_kernel(
+    const uint8_t* __restrict__ packed_stream,
+    uint8_t*       __restrict__ out_parity,
+    uint32_t n_blocks
+) {
+    uint32_t block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_id >= n_blocks) return;
+
+    uint64_t i_global;
+    uint32_t beta_idx_unused;
+    uint32_t offset_idx_unused;
+    leech::unpack_block_indices<IDX_BITS, BETA_BITS, OFFSET_BITS>(
+        packed_stream, block_id, i_global, beta_idx_unused, offset_idx_unused);
+
+    int m_shell = leech::lookup_shell(i_global);
+    int64_t I_shell = static_cast<int64_t>(i_global - leech::c_N_cumulative[m_shell]);
+    int g = leech::lookup_class(m_shell, I_shell);
+
+    out_parity[block_id] = leech::c_parity[g];
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Phase 4.0b kernel: fused decode + β·v + offset + dot product → bf16 output.
 //
 // One thread = one (m_idx, n_idx) output element. Each thread walks all
@@ -438,6 +466,7 @@ __global__ void __launch_bounds__(128, 12) leech_gemv_bf16_kernel(
     const uint8_t*       __restrict__ packed_stream,
     const __half*        __restrict__ beta_codebook, // [n_rows, k_beta]
     const __half*        __restrict__ offset_codebook, // [n_rows, k_offset] or null
+    const uint16_t*      __restrict__ parity_perm,  // [n_rows * b_blocks] or null — if non-null, iterate via this
     __nv_bfloat16*       __restrict__ out_y,         // [m, n_rows]
     uint32_t m,
     uint32_t n_rows,
@@ -499,7 +528,13 @@ __global__ void __launch_bounds__(128, 12) leech_gemv_bf16_kernel(
     float partial = 0.0f;
 
     // Each lane handles every WARP_SIZE-th k_block of this warp's output row.
-    for (uint32_t k_block = lane; k_block < b_blocks; k_block += THREADS_PER_WARP) {
+    // When parity_perm is non-null, iterate in parity-sorted order so each
+    // 32-lane warp iteration is parity-uniform (eliminates decode_even/_odd
+    // branch divergence — attack vector #1).
+    for (uint32_t local_k = lane; local_k < b_blocks; local_k += THREADS_PER_WARP) {
+        uint32_t k_block = parity_perm
+            ? static_cast<uint32_t>(parity_perm[n_idx * b_blocks + local_k])
+            : local_k;
         uint32_t block_id = n_idx * b_blocks + k_block;
 
         uint64_t i_global;
@@ -654,6 +689,7 @@ void leech_gemv_bf16_cuda(
     const uint8_t* packed_stream,
     const void*    beta_codebook,   // fp16
     const void*    offset_codebook, // fp16 or null
+    const void*    parity_perm,     // u16 [n_rows*b_blocks] or null
     void*          out_y_bf16,      // [m, n_rows] bf16
     uint32_t       m,
     uint32_t       n_rows,
@@ -677,24 +713,52 @@ void leech_gemv_bf16_cuda(
     const __nv_bfloat16* a_h  = reinterpret_cast<const __nv_bfloat16*>(a_act_bf16);
     const __half*        b_h  = reinterpret_cast<const __half*>(beta_codebook);
     const __half*        o_h  = reinterpret_cast<const __half*>(offset_codebook);
+    const uint16_t*      pp_h = reinterpret_cast<const uint16_t*>(parity_perm);
     __nv_bfloat16*       y_h  = reinterpret_cast<__nv_bfloat16*>(out_y_bf16);
 
     if (idx_bits == 54 && has_offset) {
         leech::leech_gemv_bf16_kernel<54, 3, 3, true>
-            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, o_h, y_h,
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, o_h, pp_h, y_h,
                                           m, n_rows, b_blocks, k_beta, k_offset);
     } else if (idx_bits == 54 && !has_offset) {
         leech::leech_gemv_bf16_kernel<54, 3, 0, false>
-            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, nullptr, y_h,
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, nullptr, pp_h, y_h,
                                           m, n_rows, b_blocks, k_beta, 0);
     } else if (idx_bits == 48 && has_offset) {
         leech::leech_gemv_bf16_kernel<48, 3, 3, true>
-            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, o_h, y_h,
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, o_h, pp_h, y_h,
                                           m, n_rows, b_blocks, k_beta, k_offset);
     } else if (idx_bits == 48 && !has_offset) {
         leech::leech_gemv_bf16_kernel<48, 3, 0, false>
-            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, nullptr, y_h,
+            <<<grid, block, smem_bytes, stream>>>(a_h, packed_stream, b_h, nullptr, pp_h, y_h,
                                           m, n_rows, b_blocks, k_beta, 0);
+    }
+}
+
+// Compute per-block parity (0/1) — used to build the parity permutation in
+// host code. Stream-async; caller syncs before reading the result.
+void leech_compute_block_parity_cuda(
+    const uint8_t* packed_stream,
+    uint8_t*       out_parity,
+    uint32_t       n_blocks,
+    int            idx_bits,
+    int            has_offset,
+    cudaStream_t   stream
+) {
+    constexpr int BLOCK = 128;
+    uint32_t grid = (n_blocks + BLOCK - 1) / BLOCK;
+    if (idx_bits == 54 && has_offset) {
+        leech::leech_block_parity_kernel<54, 3, 3>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, out_parity, n_blocks);
+    } else if (idx_bits == 54 && !has_offset) {
+        leech::leech_block_parity_kernel<54, 3, 0>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, out_parity, n_blocks);
+    } else if (idx_bits == 48 && has_offset) {
+        leech::leech_block_parity_kernel<48, 3, 3>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, out_parity, n_blocks);
+    } else if (idx_bits == 48 && !has_offset) {
+        leech::leech_block_parity_kernel<48, 3, 0>
+            <<<grid, BLOCK, 0, stream>>>(packed_stream, out_parity, n_blocks);
     }
 }
 

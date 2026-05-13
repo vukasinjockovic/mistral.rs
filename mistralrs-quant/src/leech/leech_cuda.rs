@@ -12,7 +12,8 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use crate::leech::ffi::{
-    leech_decode_bf16_cuda, leech_decode_v_int_cuda, leech_gemv_bf16_cuda, leech_init_tables_ffi,
+    leech_compute_block_parity_cuda, leech_decode_bf16_cuda, leech_decode_v_int_cuda,
+    leech_gemv_bf16_cuda, leech_init_tables_ffi,
 };
 
 /// Sticky one-shot init.
@@ -216,6 +217,7 @@ pub unsafe fn leech_gemv_bf16(
     packed_stream: *const u8,
     beta_codebook_ptr: *const c_void,
     offset_codebook_ptr: *const c_void,
+    parity_perm_ptr: *const c_void,
     out_y_bf16_ptr: *mut c_void,
     m: u32,
     n_rows: u32,
@@ -236,12 +238,40 @@ pub unsafe fn leech_gemv_bf16(
             packed_stream,
             beta_codebook_ptr,
             offset_codebook_ptr,
+            parity_perm_ptr,
             out_y_bf16_ptr,
             m,
             n_rows,
             b_blocks,
             k_beta,
             k_offset,
+            idx_bits as std::os::raw::c_int,
+            if has_offset { 1 } else { 0 },
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Compute per-block decode parity into out_parity_ptr (device, u8[n_blocks]).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_compute_block_parity(
+    packed_stream: *const u8,
+    out_parity_ptr: *mut u8,
+    n_blocks: u32,
+    idx_bits: u32,
+    has_offset: bool,
+    stream: *mut c_void,
+) -> Result<(), LeechDecodeError> {
+    init_tables()?;
+    if idx_bits != 48 && idx_bits != 54 {
+        return Err(LeechDecodeError::UnsupportedIdxBits(idx_bits));
+    }
+    unsafe {
+        leech_compute_block_parity_cuda(
+            packed_stream,
+            out_parity_ptr,
+            n_blocks,
             idx_bits as std::os::raw::c_int,
             if has_offset { 1 } else { 0 },
             stream,
