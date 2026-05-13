@@ -56,6 +56,44 @@ fn main() -> Result<(), String> {
         const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
         println!("cargo:rerun-if-changed=build.rs");
+
+        // Track leech kernel .cu + .cuh so cargo re-runs this build script on
+        // any edit. cudaforge content-hashes only .cu, so we additionally
+        // prune its cache for leech entries below (otherwise .cuh edits
+        // produce silent no-op rebuilds).
+        let leech_kernel_dir = std::path::Path::new("kernels/leech");
+        if leech_kernel_dir.exists() {
+            for entry in std::fs::read_dir(leech_kernel_dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                let ext = p.extension().and_then(|s| s.to_str());
+                if matches!(ext, Some("cu") | Some("cuh")) {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                }
+            }
+            let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+            for entry in std::fs::read_dir(&out_dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    if name.starts_with("leech_") && name.ends_with(".o") {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+            }
+            let cache_path = out_dir.join(".cudaforge_cache.json");
+            if let Ok(text) = std::fs::read_to_string(&cache_path) {
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(entries) =
+                        v.get_mut("entries").and_then(|e| e.as_object_mut())
+                    {
+                        entries.retain(|k, _| !k.starts_with("kernels/leech/"));
+                    }
+                    if let Ok(out) = serde_json::to_string_pretty(&v) {
+                        let _ = std::fs::write(&cache_path, out);
+                    }
+                }
+            }
+        }
+
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
         let mut builder = cudaforge::KernelBuilder::new()
