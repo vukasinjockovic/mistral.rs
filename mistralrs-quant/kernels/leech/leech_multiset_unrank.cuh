@@ -46,6 +46,21 @@ __device__ __forceinline__ int64_t perms_rem_k(
 // Unrank into out[0..n]. dist_vals (int8) and counts (uint8) are narrowed
 // device-resident tables (attack vector #4); out and rem_scratch are int8
 // caller scratch. Values fit: Leech-lattice coords |v| ≤ 32, counts ≤ 24.
+//
+// ─── Vector #2 Option A: incremental multinomial maintenance ──────────────
+// Per LLVQ paper §3.3 step 5: "small static tables, integer prefix-sum scans,
+// integer division and modulo, and local combinatorial reconstruction" —
+// explicitly NOT iterative subtraction with O(k) recomputed multinomials.
+//
+// We maintain the running multinomial M = (rem_n)! / Π rem_scratch[i]! as an
+// invariant. After picking value j: M_new = M * rem_scratch[j] / rem_n. This
+// drops per-iteration work from O(k) (the old `perms_rem_k(...)` recompute)
+// to O(1) and shortens the dependency chain to a single mul/div per step,
+// enabling much better ILP under nvcc.
+//
+// Complexity: O(n·k) ≈ 24·8 = 192 ops/call (vs prior O(n·k²) ≈ 1500).
+// Stub experiment showed unrank is ~82% of decode time; this should drop
+// 1.91 ms decode → ~0.5 ms (3-4×), bounded above by the stubbed 350 µs.
 __device__ __forceinline__ void unrank_multiset(
     int64_t  rank,
     const int8_t*  dist_vals,
@@ -55,23 +70,36 @@ __device__ __forceinline__ void unrank_multiset(
     int8_t*  out,
     int8_t*  rem_scratch
 ) {
+    // Initialize remaining counts.
     for (int i = 0; i < k; ++i) rem_scratch[i] = static_cast<int8_t>(counts[i]);
+
+    // Compute initial multinomial M = n! / Π counts[i]! via the existing
+    // perms_rem_k helper. ONE call, O(k) — not per-iteration.
+    int64_t M = perms_rem_k(rem_scratch, k, n);
+
     int64_t r = rank;
+    int rem_n = n;
+
     for (int i = 0; i < n; ++i) {
+        // Prefix-sum scan over the remaining distinct values: at each step,
+        // block_j = (# completions if we pick j next) = M * rem_scratch[j] / rem_n.
+        // Pick the smallest j such that cumulative > r.
+        int64_t cum = 0;
         for (int j = 0; j < k; ++j) {
             int8_t cnt = rem_scratch[j];
-            int8_t avail = (cnt > 0) ? 1 : 0;
-            rem_scratch[j] = static_cast<int8_t>(cnt - avail);
-            int64_t block = (avail == 1) ? perms_rem_k(rem_scratch, k, n - i - 1) : 0;
-            if (avail == 1 && r < block) {
+            if (cnt == 0) continue;
+            int64_t block_j = M * static_cast<int64_t>(cnt) / static_cast<int64_t>(rem_n);
+            int64_t cum_next = cum + block_j;
+            if (r < cum_next) {
                 out[i] = dist_vals[j];
-                // mark break: keep rem_scratch[j] decremented and exit j-loop
-                goto next_i;
+                r -= cum;
+                M = block_j;                                    // M_new = M_old * c_j / rem_n
+                rem_scratch[j] = static_cast<int8_t>(cnt - 1);  // c_j_new = c_j - 1
+                break;
             }
-            r -= block * avail;
-            rem_scratch[j] = static_cast<int8_t>(rem_scratch[j] + avail);
+            cum = cum_next;
         }
-        next_i:;
+        rem_n -= 1;
     }
 }
 
