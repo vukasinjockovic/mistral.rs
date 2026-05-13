@@ -54,8 +54,15 @@ __constant__ uint8_t  c_T[ltab::N_CLASSES];
 // __device__ mirrors of the ragged arrays (~12 MB at ms=18).
 // Loaded once per process, accessed through L1.
 // ──────────────────────────────────────────────────────────────────────────
-__device__ uint32_t d_codewords_flat[sizeof(ltab::codewords_flat) / sizeof(uint32_t)];
-__device__ int64_t  d_codewords_ofs [sizeof(ltab::codewords_ofs)  / sizeof(int64_t)];
+// Attack vector #5: replace per-class codewords_flat (~12 MB at ms=18) with
+// one universal Golay codeword table + per-class uint16 offset.
+//   d_golay_table[0:4096]    sort(all G24)              (ODD-shared)
+//   d_golay_table[4096:8192] EVEN by-weight buckets {1,759,2576,759,1}
+//   d_cw_table_offset[g]     ODD: 0; EVEN: 4096 + bucket_ofs(w_g)
+// Storage: 32 KB + ~2.4 KB at ms=18 (vs 12 MB previously). Verified
+// bit-equivalent at codegen time by tools/gen_leech_tables.py.
+__device__ uint32_t d_golay_table     [ltab::GOLAY_TABLE_TOTAL];
+__device__ uint16_t d_cw_table_offset [ltab::N_CLASSES];
 // Attack vector #4: distinct/counts/nz arrays narrowed to 8-bit. Values are
 // Leech-lattice coords (|v| ≤ 32) and counts (≤ 24), so they fit in int8/uint8.
 // 8x smaller storage → 8x more L1/L2 cache fit. The _ofs arrays stay int64
@@ -101,8 +108,9 @@ __host__ inline void leech_init_tables() {
     cudaMemcpyToSymbol(c_V2_mask,             ltab::V2_mask,             sizeof(ltab::V2_mask));
     cudaMemcpyToSymbol(c_dep_bit,             ltab::dep_bit,             sizeof(ltab::dep_bit));
     cudaMemcpyToSymbol(c_T,                   ltab::T,                   sizeof(ltab::T));
-    cudaMemcpyToSymbol(d_codewords_flat,      ltab::codewords_flat,      sizeof(ltab::codewords_flat));
-    cudaMemcpyToSymbol(d_codewords_ofs,       ltab::codewords_ofs,       sizeof(ltab::codewords_ofs));
+    // Vector #5: universal Golay codeword table replaces per-class bake.
+    cudaMemcpyToSymbol(d_golay_table,         ltab::c_golay_table,       sizeof(ltab::c_golay_table));
+    cudaMemcpyToSymbol(d_cw_table_offset,     ltab::cw_table_offset,     sizeof(ltab::cw_table_offset));
     cudaMemcpyToSymbol(d_f0_dist_flat,        ltab::f0_distinct_flat,    sizeof(ltab::f0_distinct_flat));
     cudaMemcpyToSymbol(d_f0_dist_ofs,         ltab::f0_distinct_ofs,     sizeof(ltab::f0_distinct_ofs));
     cudaMemcpyToSymbol(d_f0_cnt_flat,         ltab::f0_counts_flat,      sizeof(ltab::f0_counts_flat));
@@ -170,8 +178,8 @@ __device__ __forceinline__ void decode_even(
     int64_t rank_F0 = I_perm / oF1;
     int64_t rank_F1 = I_perm % oF1;
 
-    int64_t cw_lo = d_codewords_ofs[g];
-    uint32_t b = d_codewords_flat[cw_lo + r];
+    // Vector #5: universal Golay table lookup (replaces d_codewords_flat[cw_lo + r]).
+    uint32_t b = d_golay_table[d_cw_table_offset[g] + r];
     int w = popcount24(b);
 
     // F_0 placement: 24 - w slots
@@ -255,8 +263,8 @@ __device__ __forceinline__ void decode_odd(
     int64_t r       = i_local % A;
     int64_t I_perm  = i_local / A;
 
-    int64_t cw_lo = d_codewords_ofs[g];
-    uint32_t b = d_codewords_flat[cw_lo + r];
+    // Vector #5: universal Golay table lookup (replaces d_codewords_flat[cw_lo + r]).
+    uint32_t b = d_golay_table[d_cw_table_offset[g] + r];
 
     int64_t m_lo = d_multi_ofs[g];
     int64_t m_hi = d_multi_ofs[g + 1];
