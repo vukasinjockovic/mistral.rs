@@ -57,19 +57,38 @@ fn main() -> Result<(), String> {
 
         println!("cargo:rerun-if-changed=build.rs");
 
-        // Track leech kernel .cu + .cuh so cargo re-runs this build script on
-        // any edit. cudaforge content-hashes only .cu, so we additionally
-        // prune its cache for leech entries below (otherwise .cuh edits
-        // produce silent no-op rebuilds).
-        let leech_kernel_dir = std::path::Path::new("kernels/leech");
-        if leech_kernel_dir.exists() {
-            for entry in std::fs::read_dir(leech_kernel_dir).into_iter().flatten().flatten() {
-                let p = entry.path();
-                let ext = p.extension().and_then(|s| s.to_str());
-                if matches!(ext, Some("cu") | Some("cuh")) {
-                    println!("cargo:rerun-if-changed={}", p.display());
+        // Track leech kernel .cu + .cuh + .h so cargo re-runs this build script
+        // on any edit (including added/removed files). cudaforge content-hashes
+        // only .cu, so we additionally prune its cache for leech entries below
+        // (otherwise .cuh/.h edits or file-set changes produce silent no-op
+        // rebuilds). Covers both the combinadic baseline (kernels/leech/) and
+        // the Q24-tANS variant (kernels/leech_q24/).
+        let leech_kernel_dirs = ["kernels/leech", "kernels/leech_q24"];
+        let any_leech_dir = leech_kernel_dirs
+            .iter()
+            .any(|d| std::path::Path::new(d).exists());
+        if any_leech_dir {
+            for dir_str in &leech_kernel_dirs {
+                let leech_kernel_dir = std::path::Path::new(dir_str);
+                if !leech_kernel_dir.exists() {
+                    continue;
+                }
+                // Re-run on any edit to the directory itself (catches added /
+                // removed .cu files that cudaforge wouldn't otherwise notice).
+                println!("cargo:rerun-if-changed={}", leech_kernel_dir.display());
+                for entry in std::fs::read_dir(leech_kernel_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let p = entry.path();
+                    let ext = p.extension().and_then(|s| s.to_str());
+                    if matches!(ext, Some("cu") | Some("cuh") | Some("h")) {
+                        println!("cargo:rerun-if-changed={}", p.display());
+                    }
                 }
             }
+
             let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
             for entry in std::fs::read_dir(&out_dir).into_iter().flatten().flatten() {
                 let p = entry.path();
@@ -85,7 +104,11 @@ fn main() -> Result<(), String> {
                     if let Some(entries) =
                         v.get_mut("entries").and_then(|e| e.as_object_mut())
                     {
-                        entries.retain(|k, _| !k.starts_with("kernels/leech/"));
+                        entries.retain(|k, _| {
+                            !leech_kernel_dirs
+                                .iter()
+                                .any(|d| k.starts_with(&format!("{}/", d)))
+                        });
                     }
                     if let Ok(out) = serde_json::to_string_pretty(&v) {
                         let _ = std::fs::write(&cache_path, out);
