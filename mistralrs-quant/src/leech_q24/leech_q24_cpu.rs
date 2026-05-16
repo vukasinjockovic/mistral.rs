@@ -116,6 +116,58 @@ pub unsafe fn leech_q24_gemv_bf16_timed(
     Err(LeechQ24DecodeError::CpuNotImplemented)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtractiveVariant {
+    NoPat,
+    NoDecode,
+    NoBits,
+    NoAact,
+    NoAtomic,
+    NoState,
+}
+
+impl SubtractiveVariant {
+    pub fn name(self) -> &'static str {
+        match self {
+            SubtractiveVariant::NoPat => "V_NO_PAT",
+            SubtractiveVariant::NoDecode => "V_NO_DECODE",
+            SubtractiveVariant::NoBits => "V_NO_BITS",
+            SubtractiveVariant::NoAact => "V_NO_AACT",
+            SubtractiveVariant::NoAtomic => "V_NO_ATOMIC",
+            SubtractiveVariant::NoState => "V_NO_STATE",
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_q24_gemv_bf16_subtractive(
+    _variant: SubtractiveVariant,
+    _a_act_bf16_ptr: *const c_void,
+    _packed_buckets: *const u8,
+    _tile_states: *const u16,
+    _tile_nb_totals: *const u16,
+    _tile_bitstream: *const u64,
+    _tile_bit_offsets: *const u64,
+    _beta_idx_packed: *const u8,
+    _offset_idx_packed: *const u8,
+    _beta_lloyd_ptr: *const f32,
+    _offset_lloyd_ptr: *const f32,
+    _y_acc_f32_ptr: *mut f32,
+    _out_y_bf16_ptr: *mut c_void,
+    _r_rows: u32,
+    _b_blocks: u32,
+    _n_blocks: u32,
+    _n_tiles: u32,
+    _k_beta: u32,
+    _k_offset: u32,
+    _w_offset: i32,
+    _tile_size: i32,
+    _has_offset: bool,
+    _stream: *mut c_void,
+) -> Result<(), LeechQ24DecodeError> {
+    Err(LeechQ24DecodeError::CpuNotImplemented)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn leech_q24_gemv_bf16_warpcoop(
     _a_act_bf16_ptr: *const c_void,

@@ -929,6 +929,796 @@ extern "C" void leech_q24_gemv_bf16_timed_cuda(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Subtractive profile variants.
+//
+// Each variant is a near-clone of `leech_q24_gemv_bf16_kernel<TILE_SIZE>` with
+// ONE per-coord-step operation neutralized. Output is INCORRECT — these
+// variants exist only to measure wall-time delta when a single stage is
+// removed. The variant with the largest wall drop (vs the full v0 kernel) IS
+// the actual critical-path bottleneck.
+//
+// All variants share the v0 FFI signature so the bench harness can swap them
+// in cheaply. DCE-prevention strategy: each neutralized op is replaced with a
+// j/state/cb-dependent expression that still forces dependent registers to be
+// materialized, so the surrounding work is not folded away. The kernels are
+// NOT meant to validate correctness.
+// ─────────────────────────────────────────────────────────────────────────
+
+// V_NO_PAT — replace pat_row[j] load with `j & 1u`. No memory traffic for the
+// pattern table; everything else identical.
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_no_pat_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        // pat_row pointer NOT computed — pat_j source replaced below.
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+        float partial = 0.0f;
+        #pragma unroll
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                int j = j2 + kk;
+                // V_NO_PAT — DCE-resistant j-dependent expression in place of pat_row[j]
+                uint32_t pat_j = ((uint32_t)j) & 1u;
+                uint32_t cb = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+                float a_use = (kk == 0) ? a_f32_lo : a_f32_hi;
+                partial += w_val * a_use;
+            }
+        }
+        acc_val[slot] += partial;
+    }
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+        }
+    }
+}
+
+// V_NO_DECODE — replace c_decode_tables[cb*M+state] lookup with a state/cb
+// dependent ALU expression. No __constant__ memory traffic, but `state`
+// still flows through every iteration so the chain still executes.
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_no_decode_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+        float partial = 0.0f;
+        #pragma unroll
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                int j = j2 + kk;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb = (parity << 1) | pat_j;
+                // V_NO_DECODE — DCE-resistant ALU expression in place of c_decode_tables[]
+                uint32_t entry = (state ^ (cb * 0x9E3779B1u)) | 0x00050100u;
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+                float a_use = (kk == 0) ? a_f32_lo : a_f32_hi;
+                partial += w_val * a_use;
+            }
+        }
+        acc_val[slot] += partial;
+    }
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+        }
+    }
+}
+
+// V_NO_BITS — replace extract_nb_bits_from_window with bits_val = 0.
+// nb_left is still decremented (preserves loop semantics), state chain
+// still depends on `bits_val` (= 0) so the per-iter dependency stays,
+// but no LDG.E.64 to tile_bitstream.
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_no_bits_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+    // Defeat DCE on the unused bitstream pointer: touch one word per tile so
+    // the kernel still has the same arg-binding cost as v0.
+    uint64_t bs_stub = tile_bitstream[bit_off >> 6];
+    asm volatile("" : : "l"(bs_stub) : "memory");
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+        float partial = 0.0f;
+        #pragma unroll
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                int j = j2 + kk;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+                // V_NO_BITS — no LDG.E.64; bits_val = 0
+                uint32_t bits_val = 0u;
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+                float a_use = (kk == 0) ? a_f32_lo : a_f32_hi;
+                partial += w_val * a_use;
+            }
+        }
+        acc_val[slot] += partial;
+    }
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+        }
+    }
+}
+
+// V_NO_AACT — replace a_act bf16x2 load with a constant pair; no LDG.E.32
+// to the activation buffer. tid-dependent constants prevent CSE across
+// blocks.
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_no_aact_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+    // Defeat DCE on the unused a_act pointer: touch one half per tile.
+    __nv_bfloat16 a_stub = a_act[tid % 16u];
+    asm volatile("" : : "h"(*reinterpret_cast<unsigned short*>(&a_stub)) : "memory");
+    // Use tid-derived constants to avoid CSE across tiles.
+    float a_const_lo = 1.0f;
+    float a_const_hi = -1.0f;
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+        float partial = 0.0f;
+        // col_block silenced; suppress unused warning.
+        (void)col_block;
+        #pragma unroll
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            // V_NO_AACT — constant activation values; no a_act LDG.E.32.
+            float a_f32_lo = a_const_lo;
+            float a_f32_hi = a_const_hi;
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                int j = j2 + kk;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+                float a_use = (kk == 0) ? a_f32_lo : a_f32_hi;
+                partial += w_val * a_use;
+            }
+        }
+        acc_val[slot] += partial;
+    }
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+        }
+    }
+}
+
+// V_NO_ATOMIC — replace end-of-tile atomicAdd with a non-atomic store. There
+// IS still a global write per tile (preserves bandwidth) but no atomic
+// serialization. May race; output is wrong; that is fine.
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_no_atomic_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                // V_NO_ATOMIC — non-atomic store on overflow path too.
+                y_acc_f32[acc_row[0]] = acc_val[0];
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+        float partial = 0.0f;
+        #pragma unroll
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                int j = j2 + kk;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+                float a_use = (kk == 0) ? a_f32_lo : a_f32_hi;
+                partial += w_val * a_use;
+            }
+        }
+        acc_val[slot] += partial;
+    }
+    // V_NO_ATOMIC — non-atomic global store
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            y_acc_f32[acc_row[s]] = acc_val[s];
+        }
+    }
+}
+
+// V_NO_STATE — break the FSE state-chain dependency. After each update,
+// reset state to 0. All loads still execute (state still flows into
+// c_decode_tables[]) but the chain dependency length is reduced to 1.
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_no_state_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+        float partial = 0.0f;
+        #pragma unroll
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                int j = j2 + kk;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                // V_NO_STATE — break the FSE state-chain dependency.
+                // The expression still uses base|bits_val so the compiler
+                // keeps both live, but state never accumulates across coords.
+                state = 0u;
+                (void)base; (void)bits_val;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+                float a_use = (kk == 0) ? a_f32_lo : a_f32_hi;
+                partial += w_val * a_use;
+            }
+        }
+        acc_val[slot] += partial;
+    }
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+        }
+    }
+}
+
+// ──── Launchers (one extern "C" per variant; v0 FFI-compatible) ──────────
+
+#define LEECH_Q24_SUBTRACTIVE_LAUNCHER(NAME)                                   \
+extern "C" void leech_q24_gemv_bf16_##NAME##_cuda(                              \
+    const void*     a_act_bf16,                                                \
+    const uint8_t*  packed_buckets,                                            \
+    const uint16_t* tile_states,                                               \
+    const uint16_t* tile_nb_totals,                                            \
+    const uint64_t* tile_bitstream,                                            \
+    const uint64_t* tile_bit_offsets,                                          \
+    const uint8_t*  beta_idx_packed,                                           \
+    const uint8_t*  offset_idx_packed,                                         \
+    const float*    beta_lloyd,                                                \
+    const float*    offset_lloyd,                                              \
+    float*          y_acc_f32,                                                 \
+    void*           out_y_bf16,                                                \
+    uint32_t r_rows,                                                           \
+    uint32_t b_blocks,                                                         \
+    uint32_t n_blocks,                                                         \
+    uint32_t n_tiles,                                                          \
+    uint32_t k_beta,                                                           \
+    uint32_t k_offset,                                                         \
+    int32_t  w_offset,                                                         \
+    int32_t  tile_size,                                                        \
+    int32_t  has_offset,                                                       \
+    void*    stream                                                            \
+) {                                                                            \
+    cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
+    cudaMemsetAsync(y_acc_f32, 0, (size_t)r_rows * sizeof(float), s);          \
+    constexpr int THREADS = 128;                                               \
+    uint32_t grid = (n_tiles + THREADS - 1) / THREADS;                         \
+    switch (tile_size) {                                                       \
+        case 4:                                                                \
+            leech_q24_gemv_bf16_##NAME##_kernel<4><<<grid, THREADS, 0, s>>>(   \
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),            \
+                packed_buckets, tile_states, tile_nb_totals,                   \
+                tile_bitstream, tile_bit_offsets,                              \
+                beta_idx_packed, offset_idx_packed,                            \
+                beta_lloyd, offset_lloyd,                                      \
+                y_acc_f32,                                                     \
+                r_rows, b_blocks, n_blocks, n_tiles,                           \
+                k_beta, k_offset,                                              \
+                w_offset, has_offset                                           \
+            );                                                                 \
+            break;                                                             \
+        case 8:                                                                \
+            leech_q24_gemv_bf16_##NAME##_kernel<8><<<grid, THREADS, 0, s>>>(   \
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),            \
+                packed_buckets, tile_states, tile_nb_totals,                   \
+                tile_bitstream, tile_bit_offsets,                              \
+                beta_idx_packed, offset_idx_packed,                            \
+                beta_lloyd, offset_lloyd,                                      \
+                y_acc_f32,                                                     \
+                r_rows, b_blocks, n_blocks, n_tiles,                           \
+                k_beta, k_offset,                                              \
+                w_offset, has_offset                                           \
+            );                                                                 \
+            break;                                                             \
+        case 16:                                                               \
+            leech_q24_gemv_bf16_##NAME##_kernel<16><<<grid, THREADS, 0, s>>>(  \
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),            \
+                packed_buckets, tile_states, tile_nb_totals,                   \
+                tile_bitstream, tile_bit_offsets,                              \
+                beta_idx_packed, offset_idx_packed,                            \
+                beta_lloyd, offset_lloyd,                                      \
+                y_acc_f32,                                                     \
+                r_rows, b_blocks, n_blocks, n_tiles,                           \
+                k_beta, k_offset,                                              \
+                w_offset, has_offset                                           \
+            );                                                                 \
+            break;                                                             \
+        case 32:                                                               \
+        default:                                                               \
+            leech_q24_gemv_bf16_##NAME##_kernel<32><<<grid, THREADS, 0, s>>>(  \
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),            \
+                packed_buckets, tile_states, tile_nb_totals,                   \
+                tile_bitstream, tile_bit_offsets,                              \
+                beta_idx_packed, offset_idx_packed,                            \
+                beta_lloyd, offset_lloyd,                                      \
+                y_acc_f32,                                                     \
+                r_rows, b_blocks, n_blocks, n_tiles,                           \
+                k_beta, k_offset,                                              \
+                w_offset, has_offset                                           \
+            );                                                                 \
+            break;                                                             \
+    }                                                                          \
+    uint32_t fgrid = (r_rows + THREADS - 1) / THREADS;                         \
+    leech_q24_finalize_f32_to_bf16_kernel<<<fgrid, THREADS, 0, s>>>(           \
+        y_acc_f32,                                                             \
+        reinterpret_cast<__nv_bfloat16*>(out_y_bf16),                          \
+        r_rows                                                                 \
+    );                                                                         \
+}
+
+LEECH_Q24_SUBTRACTIVE_LAUNCHER(no_pat)
+LEECH_Q24_SUBTRACTIVE_LAUNCHER(no_decode)
+LEECH_Q24_SUBTRACTIVE_LAUNCHER(no_bits)
+LEECH_Q24_SUBTRACTIVE_LAUNCHER(no_aact)
+LEECH_Q24_SUBTRACTIVE_LAUNCHER(no_atomic)
+LEECH_Q24_SUBTRACTIVE_LAUNCHER(no_state)
+
+#undef LEECH_Q24_SUBTRACTIVE_LAUNCHER
+
+// ─────────────────────────────────────────────────────────────────────────
 // Phase B.1 — warp-cooperative fused GEMV.
 //
 // Design: one warp owns one tile. Lane 0 drives the serial FSE state chain

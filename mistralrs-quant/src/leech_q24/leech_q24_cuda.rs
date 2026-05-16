@@ -9,9 +9,11 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use crate::leech_q24::ffi::{
-    leech_q24_decode_v_int_cuda, leech_q24_gemv_bf16_cuda,
-    leech_q24_gemv_bf16_timed_cuda, leech_q24_gemv_bf16_warpcoop_cuda,
-    leech_q24_init_tables_ffi,
+    leech_q24_decode_v_int_cuda, leech_q24_gemv_bf16_cuda, leech_q24_gemv_bf16_no_aact_cuda,
+    leech_q24_gemv_bf16_no_atomic_cuda, leech_q24_gemv_bf16_no_bits_cuda,
+    leech_q24_gemv_bf16_no_decode_cuda, leech_q24_gemv_bf16_no_pat_cuda,
+    leech_q24_gemv_bf16_no_state_cuda, leech_q24_gemv_bf16_timed_cuda,
+    leech_q24_gemv_bf16_warpcoop_cuda, leech_q24_init_tables_ffi,
 };
 
 /// Sticky one-shot init guard. Subsequent `init_tables` calls with the SAME
@@ -385,6 +387,119 @@ pub unsafe fn leech_q24_gemv_bf16_warpcoop(
             if has_offset { 1 } else { 0 },
             stream,
         );
+    }
+    Ok(())
+}
+
+/// Selector for the subtractive profile variants. Each variant disables ONE
+/// per-coord operation; output is INCORRECT but wall time reveals which stage
+/// is on the critical path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtractiveVariant {
+    NoPat,
+    NoDecode,
+    NoBits,
+    NoAact,
+    NoAtomic,
+    NoState,
+}
+
+impl SubtractiveVariant {
+    pub fn name(self) -> &'static str {
+        match self {
+            SubtractiveVariant::NoPat => "V_NO_PAT",
+            SubtractiveVariant::NoDecode => "V_NO_DECODE",
+            SubtractiveVariant::NoBits => "V_NO_BITS",
+            SubtractiveVariant::NoAact => "V_NO_AACT",
+            SubtractiveVariant::NoAtomic => "V_NO_ATOMIC",
+            SubtractiveVariant::NoState => "V_NO_STATE",
+        }
+    }
+}
+
+/// Launch one of the subtractive profile variants. Same FFI signature and
+/// argument set as [`leech_q24_gemv_bf16`]; output values are NOT correct.
+///
+/// # Safety
+/// All pointers must reference device memory of the declared size.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_q24_gemv_bf16_subtractive(
+    variant: SubtractiveVariant,
+    a_act_bf16_ptr: *const c_void,
+    packed_buckets: *const u8,
+    tile_states: *const u16,
+    tile_nb_totals: *const u16,
+    tile_bitstream: *const u64,
+    tile_bit_offsets: *const u64,
+    beta_idx_packed: *const u8,
+    offset_idx_packed: *const u8,
+    beta_lloyd_ptr: *const f32,
+    offset_lloyd_ptr: *const f32,
+    y_acc_f32_ptr: *mut f32,
+    out_y_bf16_ptr: *mut c_void,
+    r_rows: u32,
+    b_blocks: u32,
+    n_blocks: u32,
+    n_tiles: u32,
+    k_beta: u32,
+    k_offset: u32,
+    w_offset: i32,
+    tile_size: i32,
+    has_offset: bool,
+    stream: *mut c_void,
+) -> Result<(), LeechQ24DecodeError> {
+    if !matches!(tile_size, 4 | 8 | 16 | 32) {
+        return Err(LeechQ24DecodeError::UnsupportedTileSize(tile_size));
+    }
+    if !(w_offset == 3 || w_offset == 4) {
+        return Err(LeechQ24DecodeError::UnsupportedWOffset(w_offset));
+    }
+    let has_off = if has_offset { 1 } else { 0 };
+    unsafe {
+        match variant {
+            SubtractiveVariant::NoPat => leech_q24_gemv_bf16_no_pat_cuda(
+                a_act_bf16_ptr, packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets, beta_idx_packed, offset_idx_packed,
+                beta_lloyd_ptr, offset_lloyd_ptr, y_acc_f32_ptr, out_y_bf16_ptr,
+                r_rows, b_blocks, n_blocks, n_tiles, k_beta, k_offset,
+                w_offset, tile_size, has_off, stream,
+            ),
+            SubtractiveVariant::NoDecode => leech_q24_gemv_bf16_no_decode_cuda(
+                a_act_bf16_ptr, packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets, beta_idx_packed, offset_idx_packed,
+                beta_lloyd_ptr, offset_lloyd_ptr, y_acc_f32_ptr, out_y_bf16_ptr,
+                r_rows, b_blocks, n_blocks, n_tiles, k_beta, k_offset,
+                w_offset, tile_size, has_off, stream,
+            ),
+            SubtractiveVariant::NoBits => leech_q24_gemv_bf16_no_bits_cuda(
+                a_act_bf16_ptr, packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets, beta_idx_packed, offset_idx_packed,
+                beta_lloyd_ptr, offset_lloyd_ptr, y_acc_f32_ptr, out_y_bf16_ptr,
+                r_rows, b_blocks, n_blocks, n_tiles, k_beta, k_offset,
+                w_offset, tile_size, has_off, stream,
+            ),
+            SubtractiveVariant::NoAact => leech_q24_gemv_bf16_no_aact_cuda(
+                a_act_bf16_ptr, packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets, beta_idx_packed, offset_idx_packed,
+                beta_lloyd_ptr, offset_lloyd_ptr, y_acc_f32_ptr, out_y_bf16_ptr,
+                r_rows, b_blocks, n_blocks, n_tiles, k_beta, k_offset,
+                w_offset, tile_size, has_off, stream,
+            ),
+            SubtractiveVariant::NoAtomic => leech_q24_gemv_bf16_no_atomic_cuda(
+                a_act_bf16_ptr, packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets, beta_idx_packed, offset_idx_packed,
+                beta_lloyd_ptr, offset_lloyd_ptr, y_acc_f32_ptr, out_y_bf16_ptr,
+                r_rows, b_blocks, n_blocks, n_tiles, k_beta, k_offset,
+                w_offset, tile_size, has_off, stream,
+            ),
+            SubtractiveVariant::NoState => leech_q24_gemv_bf16_no_state_cuda(
+                a_act_bf16_ptr, packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets, beta_idx_packed, offset_idx_packed,
+                beta_lloyd_ptr, offset_lloyd_ptr, y_acc_f32_ptr, out_y_bf16_ptr,
+                r_rows, b_blocks, n_blocks, n_tiles, k_beta, k_offset,
+                w_offset, tile_size, has_off, stream,
+            ),
+        }
     }
     Ok(())
 }
