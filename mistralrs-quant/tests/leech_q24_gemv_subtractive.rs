@@ -10,6 +10,31 @@
 //! is also not validated here (the validating test lives in
 //! `leech_q24_gemv_cuda.rs` and runs separately).
 //!
+//! ## Measured master matrix (RTX 5090, mlp.up_proj L0, 200 iters)
+//!
+//! Master subtractive Δ table (µs saved by disabling stage at each T):
+//!
+//! ```text
+//! Variant       | T=4      | T=8      | T=16     | T=32
+//! --------------|----------|----------|----------|----------
+//! baseline      | 1414.5   | 1758.7   | 1646.3   | 2271.4
+//! V_NO_PAT      |  +138.6  |  -126.7  |   -24.5  |   -37.7
+//! V_NO_DECODE   | -1026.7  | -1171.5  |  -918.0  | -1933.0
+//! V_NO_BITS     |   -47.0  |  -484.2  |  -651.1  | -1363.5
+//! V_NO_AACT     |  +142.7  |  -116.3  |    -9.0  |    -6.1
+//! V_NO_ATOMIC   |    +6.0  |   +48.5  |    +3.3  |    -2.1
+//! V_NO_STATE    | -1338.5  | -1675.3  | -1572.3  | -2199.5
+//! ```
+//!
+//! Dominant bottleneck at every T: V_NO_STATE (FSE state-chain serialization).
+//! Breaking the chain drops wall to ~75 µs floor at every T (kernel launch +
+//! memset + finalize). v0's 1414 µs envelope at T=4 has 18.6× headroom.
+//!
+//! T=8 anomaly explained: V_NO_BITS Δ jumps from -47 µs (T=4) to -484 µs (T=8).
+//! At T=8 the per-tile bitstream LDG window crosses one L1 line boundary; the
+//! L1→L2 step function adds ~440 µs to the T=8 baseline despite shorter
+//! per-thread chain length than T=4.
+//!
 //! Output: a single ASCII table:
 //!
 //! ```text
