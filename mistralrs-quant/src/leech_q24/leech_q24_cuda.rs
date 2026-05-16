@@ -13,7 +13,7 @@ use crate::leech_q24::ffi::{
     leech_q24_gemv_bf16_no_atomic_cuda, leech_q24_gemv_bf16_no_bits_cuda,
     leech_q24_gemv_bf16_no_decode_cuda, leech_q24_gemv_bf16_no_pat_cuda,
     leech_q24_gemv_bf16_no_state_cuda, leech_q24_gemv_bf16_timed_cuda,
-    leech_q24_gemv_bf16_warpcoop_cuda, leech_q24_init_tables_ffi,
+    leech_q24_gemv_bf16_v4_cuda, leech_q24_gemv_bf16_warpcoop_cuda, leech_q24_init_tables_ffi,
 };
 
 /// Sticky one-shot init guard. Subsequent `init_tables` calls with the SAME
@@ -28,6 +28,8 @@ pub enum LeechQ24DecodeError {
     OutputBufferTooSmall { needed: usize, got: usize },
     UnsupportedTileSize(i32),
     UnsupportedWOffset(i32),
+    UnsupportedNumStreams(i32),
+    NumStreamsDoesNotDivideTileSize { tile_size: i32, num_streams: i32 },
     TileBitOffsetsTooSmall { needed: usize, got: usize },
     DecodeTablesWrongSize { needed: usize, got: usize },
 }
@@ -45,6 +47,18 @@ impl fmt::Display for LeechQ24DecodeError {
                 write!(
                     f,
                     "unsupported w_offset {w}: ms=13 → 3, ms=18 → 4 are the only supported values"
+                )
+            }
+            LeechQ24DecodeError::UnsupportedNumStreams(k) => {
+                write!(
+                    f,
+                    "unsupported num_streams {k}: v4 requires K ∈ {{1, 2, 4, 8, 16, 32}}"
+                )
+            }
+            LeechQ24DecodeError::NumStreamsDoesNotDivideTileSize { tile_size, num_streams } => {
+                write!(
+                    f,
+                    "num_streams {num_streams} must divide tile_size {tile_size} (K | T invariant)"
                 )
             }
             LeechQ24DecodeError::TileBitOffsetsTooSmall { needed, got } => {
@@ -78,6 +92,62 @@ pub fn compute_tile_bit_offsets(tile_nb_totals: &[u16]) -> Vec<u64> {
         acc += nb as u64;
     }
     out
+}
+
+/// v4: derive per-substream absolute bit offsets (within the global
+/// tile_bitstream) from the aggregate `tile_nb_totals` and per-sub-stream
+/// `substream_nb_totals`. Output is `[n_tiles, K] u64` in tile-major order.
+///
+/// For each tile `t`, the K sub-streams' bit windows live end-to-end inside
+/// the tile's overall bit run (which starts at `Σ_{j<t} tile_nb_totals[j]`).
+///
+/// At K=1 this is byte-equal to `compute_tile_bit_offsets(tile_nb_totals)`.
+pub fn compute_substream_bit_offsets(
+    tile_nb_totals: &[u16],
+    substream_nb_totals: &[u16],
+    k: usize,
+) -> Vec<u64> {
+    assert!(k >= 1, "num_streams must be >= 1");
+    let n_tiles = tile_nb_totals.len();
+    assert_eq!(
+        substream_nb_totals.len(),
+        n_tiles * k,
+        "substream_nb_totals must have length n_tiles * K"
+    );
+    let mut out = Vec::with_capacity(n_tiles * k);
+    let mut tile_bit_cursor: u64 = 0;
+    for t in 0..n_tiles {
+        let mut sub_cursor: u64 = 0;
+        for kk in 0..k {
+            out.push(tile_bit_cursor + sub_cursor);
+            sub_cursor += substream_nb_totals[t * k + kk] as u64;
+        }
+        debug_assert_eq!(
+            sub_cursor, tile_nb_totals[t] as u64,
+            "Σ_k substream_nb_totals[t={t}, k] != tile_nb_totals[t]"
+        );
+        tile_bit_cursor += tile_nb_totals[t] as u64;
+    }
+    out
+}
+
+/// Convenience: returns true if `K` is one of the v4-supported sub-stream
+/// counts AND divides `tile_size`. The Rust caller should validate before
+/// dispatching; the CUDA launcher also rejects but with less context.
+pub fn validate_t_k_pair(tile_size: i32, num_streams: i32) -> Result<(), LeechQ24DecodeError> {
+    if !matches!(tile_size, 4 | 8 | 16 | 32) {
+        return Err(LeechQ24DecodeError::UnsupportedTileSize(tile_size));
+    }
+    if !matches!(num_streams, 1 | 2 | 4 | 8 | 16 | 32) {
+        return Err(LeechQ24DecodeError::UnsupportedNumStreams(num_streams));
+    }
+    if tile_size % num_streams != 0 {
+        return Err(LeechQ24DecodeError::NumStreamsDoesNotDivideTileSize {
+            tile_size,
+            num_streams,
+        });
+    }
+    Ok(())
 }
 
 /// One-shot init. Copies the FSE decode_tables (4 × 1024 × u32) and the
@@ -244,6 +314,89 @@ pub unsafe fn leech_q24_gemv_bf16(
             k_offset,
             w_offset,
             tile_size,
+            if has_offset { 1 } else { 0 },
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// v4 K-parallel sub-stream fused GEMV.
+///
+/// One thread per sub-stream per tile. Threads with the same `tile_id` sit
+/// on K consecutive lane positions in a warp and reduce partial sums via
+/// `__shfl_xor_sync` before the final atomicAdd.
+///
+/// Buffers:
+/// - `substream_states`: device, `[n_tiles, K] u16`.
+/// - `substream_nb_totals`: device, `[n_tiles, K] u16`. Sum across K equals
+///   the legacy aggregate `tile_nb_totals[t]`.
+/// - `substream_bit_offsets`: device, `[n_tiles, K] u64`. Computed host-side
+///   via [`compute_substream_bit_offsets`].
+///
+/// Constraints (validated host-side AND inside the CUDA launcher):
+/// - `tile_size ∈ {4, 8, 16, 32}`
+/// - `num_streams ∈ {1, 2, 4, 8, 16, 32}`
+/// - `num_streams` MUST divide `tile_size` (K | T invariant).
+///
+/// At `num_streams = 1` the kernel reduces to v0 algorithmically (one thread
+/// per tile), with substream_* arrays aliasing the v3 tile_* arrays.
+///
+/// # Safety
+/// All pointers must reference device memory of the declared size.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_q24_gemv_bf16_v4(
+    a_act_bf16_ptr: *const c_void,
+    packed_buckets: *const u8,
+    substream_states: *const u16,
+    substream_nb_totals: *const u16,
+    tile_bitstream: *const u64,
+    substream_bit_offsets: *const u64,
+    beta_idx_packed: *const u8,
+    offset_idx_packed: *const u8,
+    beta_lloyd_ptr: *const f32,
+    offset_lloyd_ptr: *const f32,
+    y_acc_f32_ptr: *mut f32,
+    out_y_bf16_ptr: *mut c_void,
+    r_rows: u32,
+    b_blocks: u32,
+    n_blocks: u32,
+    n_tiles: u32,
+    k_beta: u32,
+    k_offset: u32,
+    w_offset: i32,
+    tile_size: i32,
+    num_streams: i32,
+    has_offset: bool,
+    stream: *mut c_void,
+) -> Result<(), LeechQ24DecodeError> {
+    validate_t_k_pair(tile_size, num_streams)?;
+    if !(w_offset == 3 || w_offset == 4) {
+        return Err(LeechQ24DecodeError::UnsupportedWOffset(w_offset));
+    }
+    unsafe {
+        leech_q24_gemv_bf16_v4_cuda(
+            a_act_bf16_ptr,
+            packed_buckets,
+            substream_states,
+            substream_nb_totals,
+            tile_bitstream,
+            substream_bit_offsets,
+            beta_idx_packed,
+            offset_idx_packed,
+            beta_lloyd_ptr,
+            offset_lloyd_ptr,
+            y_acc_f32_ptr,
+            out_y_bf16_ptr,
+            r_rows,
+            b_blocks,
+            n_blocks,
+            n_tiles,
+            k_beta,
+            k_offset,
+            w_offset,
+            tile_size,
+            num_streams,
             if has_offset { 1 } else { 0 },
             stream,
         );

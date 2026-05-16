@@ -527,6 +527,353 @@ extern "C" void leech_q24_gemv_bf16_cuda(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Phase v4: K-parallel FSE sub-streams per tile.
+//
+// Each TILE has K threads working independent FSE chains over (T / K) blocks.
+// Threads with the same `tile_id` sit on K consecutive lane positions within
+// a warp (because blockDim.x = 128 = 4 warps and K ∈ {1,2,4,8,16,32} all
+// divide 32). After per-thread accumulation we butterfly-xor-reduce across
+// the K lanes within each tile, then lane k=0 emits the 1 or 2 atomicAdds.
+//
+// See plan §4.3 for the algorithm and the lane-mask math.
+// ─────────────────────────────────────────────────────────────────────────
+
+template<int TILE_SIZE, int NUM_STREAMS>
+__global__ void leech_q24_gemv_bf16_v4_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ substream_states,        // [n_tiles, K]
+    const uint16_t* __restrict__ substream_nb_totals,     // [n_tiles, K]
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ substream_bit_offsets,   // [n_tiles, K]
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    static_assert(NUM_STREAMS >= 1 && NUM_STREAMS <= 32 && (32 % NUM_STREAMS) == 0,
+                  "v4 kernel requires K ∈ {1,2,4,8,16,32} (K | 32)");
+    static_assert(TILE_SIZE % NUM_STREAMS == 0,
+                  "v4 kernel requires K | T (sub-stream owns T/K blocks)");
+
+    constexpr int K = NUM_STREAMS;
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t tile_id = gid / K;
+    uint32_t k = gid - tile_id * K;
+    if (tile_id >= n_tiles) return;
+
+    uint32_t state    = (uint32_t)substream_states[tile_id * K + k];
+    int32_t  nb_left  = (int32_t)substream_nb_totals[tile_id * K + k];
+    uint64_t bit_off  =          substream_bit_offsets[tile_id * K + k];
+
+    uint32_t tile_start = tile_id * (uint32_t)TILE_SIZE;
+    uint32_t tile_end   = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+
+    // Per-thread partial sums across this sub-stream's blocks.
+    // Up to 2 row slots — same logic as v0; sub-stream k visits a subset of
+    // the tile's blocks but row membership is unchanged.
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count  = 0;
+
+    // Iterate over THIS sub-stream's blocks only: bi_rel = k, k+K, k+2K, ...
+    // FORWARD order (decoder consumes terminal-state-first).
+    #pragma unroll
+    for (int bi_rel_static = 0; bi_rel_static < TILE_SIZE; bi_rel_static += K) {
+        uint32_t bi_rel = (uint32_t)bi_rel_static + k;
+        if (bi_rel >= (uint32_t)TILE_SIZE) break;
+        uint32_t bi = tile_start + bi_rel;
+        if (bi >= tile_end) break;
+
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+
+        uint32_t row       = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base    = col_block * (uint32_t)COORDS_PER_BLOCK;
+
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                // Tile spans > 2 rows — unexpected at production T/B values.
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+
+        float partial = 0.0f;
+
+        // 24-coord FSE decode + GEMV inner loop — IDENTICAL math to the v0
+        // bf16x2 kernel, just running on this sub-stream's FSE state.
+        #pragma unroll
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
+
+            #pragma unroll
+            for (int dj = 0; dj < 2; ++dj) {
+                int j = j2 + dj;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb    = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym   = entry & 0xFFu;
+                uint32_t nb    = (entry >> 8) & 0xFFu;
+                uint32_t base  = entry >> 16;
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+                partial += w_val * (dj == 0 ? a_f32_lo : a_f32_hi);
+            }
+        }
+
+        acc_val[slot] += partial;
+    }
+
+    // ── Cross-sub-stream reduce within the warp ───────────────────────
+    // K threads of the same tile_id sit at adjacent lane positions in the
+    // warp. Each warp holds (32 / K) tiles. Reduce per-row partials across
+    // the K lanes; lane k=0 emits the atomicAdds.
+    //
+    // Algorithm (plan §4.3 step-by-step):
+    //   1. Lane k=0 broadcasts (row_a, row_b) to the K-1 peers.
+    //   2. Each lane maps its own (acc_row[s], acc_val[s]) into a 2-slot
+    //      (val_a, val_b) keyed on (row_a, row_b). Mismatched row → 0.
+    //   3. Butterfly-xor reduce across K lanes (log2(K) levels).
+    //   4. Lane k=0 issues 1-2 atomicAdds.
+
+    const uint32_t warp_lane = threadIdx.x & 31u;
+    const uint32_t tile_lane0 = warp_lane - k;
+    // Mask of the K lanes belonging to this tile (K consecutive lanes
+    // starting at tile_lane0). K divides 32, so this fits in 32 bits.
+    const uint32_t mask = ((1u << K) - 1u) << tile_lane0;
+
+    // Step 1: lane k=0 owns the canonical (row_a, row_b) for the tile.
+    uint32_t row_a = __shfl_sync(mask, acc_row[0], tile_lane0);
+    uint32_t row_b = __shfl_sync(mask, acc_row[1], tile_lane0);
+
+    // Step 2: re-key our own (row, val) pairs into (val_a, val_b).
+    float val_a = 0.0f, val_b = 0.0f;
+    if (acc_count > 0) {
+        if (acc_row[0] == row_a)      val_a += acc_val[0];
+        else if (acc_row[0] == row_b) val_b += acc_val[0];
+    }
+    if (acc_count > 1) {
+        if (acc_row[1] == row_a)      val_a += acc_val[1];
+        else if (acc_row[1] == row_b) val_b += acc_val[1];
+    }
+
+    // Step 3: butterfly-xor reduce across K lanes.
+    #pragma unroll
+    for (int xor_off = K / 2; xor_off > 0; xor_off >>= 1) {
+        val_a += __shfl_xor_sync(mask, val_a, xor_off);
+        val_b += __shfl_xor_sync(mask, val_b, xor_off);
+    }
+
+    // Step 4: lane k=0 issues atomicAdds.
+    if (k == 0u) {
+        if (row_a != UINT32_MAX) atomicAdd(&y_acc_f32[row_a], val_a);
+        if (row_b != UINT32_MAX) atomicAdd(&y_acc_f32[row_b], val_b);
+    }
+}
+
+// Internal launcher templated on T; runtime dispatches over K.
+template<int TILE_SIZE>
+static inline void launch_v4_dispatch_K(
+    int32_t num_streams,
+    cudaStream_t s, uint32_t grid, int threads,
+    const void* a_act_bf16,
+    const uint8_t* packed_buckets,
+    const uint16_t* substream_states,
+    const uint16_t* substream_nb_totals,
+    const uint64_t* tile_bitstream,
+    const uint64_t* substream_bit_offsets,
+    const uint8_t* beta_idx_packed,
+    const uint8_t* offset_idx_packed,
+    const float* beta_lloyd,
+    const float* offset_lloyd,
+    float* y_acc_f32,
+    uint32_t r_rows, uint32_t b_blocks, uint32_t n_blocks, uint32_t n_tiles,
+    uint32_t k_beta, uint32_t k_offset,
+    int32_t w_offset, int32_t has_offset
+) {
+    // Only the valid (T, K) pairs (K | T) are instantiated.
+    #define LAUNCH(K_) \
+        leech_q24_gemv_bf16_v4_kernel<TILE_SIZE, K_><<<grid, threads, 0, s>>>( \
+            reinterpret_cast<const __nv_bfloat16*>(a_act_bf16), \
+            packed_buckets, substream_states, substream_nb_totals, \
+            tile_bitstream, substream_bit_offsets, \
+            beta_idx_packed, offset_idx_packed, beta_lloyd, offset_lloyd, \
+            y_acc_f32, r_rows, b_blocks, n_blocks, n_tiles, \
+            k_beta, k_offset, w_offset, has_offset)
+    switch (num_streams) {
+        case 1:
+            if constexpr (TILE_SIZE % 1 == 0) { LAUNCH(1); }
+            break;
+        case 2:
+            if constexpr (TILE_SIZE % 2 == 0) { LAUNCH(2); }
+            else { fprintf(stderr, "leech_q24 v4: K=2 ∤ T=%d\n", TILE_SIZE); }
+            break;
+        case 4:
+            if constexpr (TILE_SIZE % 4 == 0) { LAUNCH(4); }
+            else { fprintf(stderr, "leech_q24 v4: K=4 ∤ T=%d\n", TILE_SIZE); }
+            break;
+        case 8:
+            if constexpr (TILE_SIZE % 8 == 0) { LAUNCH(8); }
+            else { fprintf(stderr, "leech_q24 v4: K=8 ∤ T=%d\n", TILE_SIZE); }
+            break;
+        case 16:
+            if constexpr (TILE_SIZE % 16 == 0) { LAUNCH(16); }
+            else { fprintf(stderr, "leech_q24 v4: K=16 ∤ T=%d\n", TILE_SIZE); }
+            break;
+        case 32:
+            if constexpr (TILE_SIZE % 32 == 0) { LAUNCH(32); }
+            else { fprintf(stderr, "leech_q24 v4: K=32 ∤ T=%d\n", TILE_SIZE); }
+            break;
+        default:
+            fprintf(stderr,
+                "leech_q24 v4: unsupported num_streams=%d (must be in "
+                "{1,2,4,8,16,32})\n", num_streams);
+            break;
+    }
+    #undef LAUNCH
+}
+
+extern "C" void leech_q24_gemv_bf16_v4_cuda(
+    const void*     a_act_bf16,
+    const uint8_t*  packed_buckets,
+    const uint16_t* substream_states,
+    const uint16_t* substream_nb_totals,
+    const uint64_t* tile_bitstream,
+    const uint64_t* substream_bit_offsets,
+    const uint8_t*  beta_idx_packed,
+    const uint8_t*  offset_idx_packed,
+    const float*    beta_lloyd,
+    const float*    offset_lloyd,
+    float*          y_acc_f32,
+    void*           out_y_bf16,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  tile_size,
+    int32_t  num_streams,
+    int32_t  has_offset,
+    void*    stream
+) {
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    cudaMemsetAsync(y_acc_f32, 0, (size_t)r_rows * sizeof(float), s);
+    constexpr int THREADS = 128;
+    uint32_t total_threads = n_tiles * (uint32_t)num_streams;
+    uint32_t grid = (total_threads + THREADS - 1) / THREADS;
+    // Dispatch T → K, with K | T enforced at the inner switch. If the user
+    // passes K ∤ T we fprintf an error and silently no-op (the test catches it).
+    switch (tile_size) {
+        case 4:
+            launch_v4_dispatch_K<4>(
+                num_streams, s, grid, THREADS,
+                a_act_bf16, packed_buckets, substream_states, substream_nb_totals,
+                tile_bitstream, substream_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd, y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset, w_offset, has_offset);
+            break;
+        case 8:
+            launch_v4_dispatch_K<8>(
+                num_streams, s, grid, THREADS,
+                a_act_bf16, packed_buckets, substream_states, substream_nb_totals,
+                tile_bitstream, substream_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd, y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset, w_offset, has_offset);
+            break;
+        case 16:
+            launch_v4_dispatch_K<16>(
+                num_streams, s, grid, THREADS,
+                a_act_bf16, packed_buckets, substream_states, substream_nb_totals,
+                tile_bitstream, substream_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd, y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset, w_offset, has_offset);
+            break;
+        case 32:
+            launch_v4_dispatch_K<32>(
+                num_streams, s, grid, THREADS,
+                a_act_bf16, packed_buckets, substream_states, substream_nb_totals,
+                tile_bitstream, substream_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd, y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset, w_offset, has_offset);
+            break;
+        default:
+            fprintf(stderr,
+                "leech_q24 v4: unsupported tile_size=%d, "
+                "falling back to T=32\n", tile_size);
+            launch_v4_dispatch_K<32>(
+                num_streams, s, grid, THREADS,
+                a_act_bf16, packed_buckets, substream_states, substream_nb_totals,
+                tile_bitstream, substream_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd, y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset, w_offset, has_offset);
+            break;
+    }
+    uint32_t fgrid = (r_rows + THREADS - 1) / THREADS;
+    leech_q24_finalize_f32_to_bf16_kernel<<<fgrid, THREADS, 0, s>>>(
+        y_acc_f32,
+        reinterpret_cast<__nv_bfloat16*>(out_y_bf16),
+        r_rows
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Instrumented variant: per-stage clock64() profiling of the v0 GEMV kernel.
 //
 // Brackets 8 per-coord-step operations with clock64() and accumulates cycles

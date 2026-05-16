@@ -279,6 +279,45 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    /// v4 K-parallel sub-stream fused GEMV. Identical math to v0 but each
+    /// tile is decoded by `num_streams` cooperating threads (K | tile_size).
+    /// Sub-stream k owns blocks-in-tile with (block_in_tile % K) == k. The K
+    /// threads sit on K consecutive lane positions within a warp (K divides
+    /// 32 always), and partial sums are warp-reduced before the atomicAdd.
+    ///
+    /// Buffer layouts (DEVICE pointers):
+    ///   substream_states[n_tiles, K] u16   — sub-stream starting states
+    ///   substream_nb_totals[n_tiles, K] u16  — bits per sub-stream
+    ///   substream_bit_offsets[n_tiles, K] u64  — absolute bit offsets (host-side prefix-sum)
+    ///
+    /// `num_streams` must be ∈ {1, 2, 4, 8, 16, 32} AND must divide `tile_size`.
+    /// Invalid (T, K) pairs log an error and no-op.
+    pub(crate) fn leech_q24_gemv_bf16_v4_cuda(
+        a_act_bf16: *const c_void,
+        packed_buckets: *const u8,
+        substream_states: *const u16,
+        substream_nb_totals: *const u16,
+        tile_bitstream: *const u64,
+        substream_bit_offsets: *const u64,
+        beta_idx_packed: *const u8,
+        offset_idx_packed: *const u8,
+        beta_lloyd: *const f32,
+        offset_lloyd: *const f32,
+        y_acc_f32: *mut f32,
+        out_y_bf16: *mut c_void,
+        r_rows: u32,
+        b_blocks: u32,
+        n_blocks: u32,
+        n_tiles: u32,
+        k_beta: u32,
+        k_offset: u32,
+        w_offset: i32,
+        tile_size: i32,
+        num_streams: i32,
+        has_offset: i32,
+        stream: *mut c_void,
+    );
+
     /// Phase B.1 warp-cooperative fused GEMV. Same signature as
     /// `leech_q24_gemv_bf16_cuda`. Selectable at runtime by the caller
     /// (env-var `LEECHQ24_WARPCOOP` in tests / `LeechLayer` flag in the
