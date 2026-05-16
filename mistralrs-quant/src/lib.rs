@@ -29,6 +29,7 @@ mod gptq;
 mod hqq;
 mod imatrix;
 pub mod leech;
+pub mod leech_q24;
 mod lora;
 mod mxfp4;
 mod pending_layer;

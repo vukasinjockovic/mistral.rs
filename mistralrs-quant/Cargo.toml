@@ -38,6 +38,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 mistralrs-leech = { path = "../mistralrs-leech" }
+mistralrs-leech-q24 = { path = "../mistralrs-leech-q24" }
 
 [features]
 cuda = [

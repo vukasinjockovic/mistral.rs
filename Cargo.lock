@@ -3623,6 +3623,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mistralrs-leech-q24"
+version = "0.8.1"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "half",
+ "hex",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mistralrs-macros"
 version = "0.8.1"
 dependencies = [
@@ -3711,6 +3725,7 @@ dependencies = [
  "lazy_static",
  "memmap2",
  "mistralrs-leech",
+ "mistralrs-leech-q24",
  "objc2-foundation",
  "objc2-metal",
  "paste",

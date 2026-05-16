@@ -1,0 +1,159 @@
+//! CUDA-backed Q24-tANS decode-only entry point.
+//!
+//! Drives the kernel in `mistralrs-quant/kernels/leech_q24/leech_q24_decode.cu`
+//! from safe Rust. Phase A is decode-only — fused decode+β·v+offset+GEMV is
+//! Phase B and lives in a sibling file.
+
+use std::ffi::c_void;
+use std::fmt;
+use std::sync::OnceLock;
+
+use crate::leech_q24::ffi::{leech_q24_decode_v_int_cuda, leech_q24_init_tables_ffi};
+
+/// Sticky one-shot init guard. Subsequent `init_tables` calls with the SAME
+/// `symbol_set_id` are a no-op; with a DIFFERENT `symbol_set_id`, the second
+/// call re-runs the `cudaMemcpyToSymbol`s. The latter case is rare (only when
+/// a process loads multiple .leech files with different ms variants), and
+/// nothing else depends on the previous state.
+static TABLES_INITIALIZED: OnceLock<()> = OnceLock::new();
+
+#[derive(Debug)]
+pub enum LeechQ24DecodeError {
+    OutputBufferTooSmall { needed: usize, got: usize },
+    UnsupportedTileSize(i32),
+    UnsupportedWOffset(i32),
+    TileBitOffsetsTooSmall { needed: usize, got: usize },
+    DecodeTablesWrongSize { needed: usize, got: usize },
+}
+
+impl fmt::Display for LeechQ24DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LeechQ24DecodeError::OutputBufferTooSmall { needed, got } => {
+                write!(f, "out_v too small: need {needed} bytes, got {got}")
+            }
+            LeechQ24DecodeError::UnsupportedTileSize(t) => {
+                write!(f, "unsupported tile_size {t}: production kernel hard-codes 32")
+            }
+            LeechQ24DecodeError::UnsupportedWOffset(w) => {
+                write!(
+                    f,
+                    "unsupported w_offset {w}: ms=13 → 3, ms=18 → 4 are the only supported values"
+                )
+            }
+            LeechQ24DecodeError::TileBitOffsetsTooSmall { needed, got } => {
+                write!(
+                    f,
+                    "tile_bit_offsets too small: need {needed} u64s, got {got}"
+                )
+            }
+            LeechQ24DecodeError::DecodeTablesWrongSize { needed, got } => {
+                write!(
+                    f,
+                    "decode_tables wrong size: need {needed} u32s (4 × 1024), got {got}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LeechQ24DecodeError {}
+
+/// Compute the host-side prefix sum of `tile_nb_totals` (u16) into
+/// `tile_bit_offsets` (u64). The output's element `i` holds the cumulative
+/// bit count of all tiles before `i`, so `out[0] = 0` and
+/// `out[n] = Σ tile_nb_totals[0..n]`. The kernel uses this as the absolute
+/// bit-offset base for each tile.
+pub fn compute_tile_bit_offsets(tile_nb_totals: &[u16]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(tile_nb_totals.len());
+    let mut acc: u64 = 0;
+    for &nb in tile_nb_totals {
+        out.push(acc);
+        acc += nb as u64;
+    }
+    out
+}
+
+/// One-shot init. Copies the FSE decode_tables (4 × 1024 × u32) and the
+/// universal pattern_table baked at compile time into the kernel's
+/// `__constant__` / `__device__` arrays.
+///
+/// `decode_tables` is a host slice of `4 × 1024 = 4096` u32 entries
+/// (n_codebooks × M_TABLE). The pattern_table is taken from the compile-time
+/// baked header — the LEECHQ24 file's `pattern_table_blake3` header field
+/// MUST match the constant in `leech_q24_pattern_table.h`.
+pub fn init_tables(decode_tables: &[u32], symbol_set_id: u32) -> Result<(), LeechQ24DecodeError> {
+    const NEEDED: usize = 4 * 1024;
+    if decode_tables.len() != NEEDED {
+        return Err(LeechQ24DecodeError::DecodeTablesWrongSize {
+            needed: NEEDED,
+            got: decode_tables.len(),
+        });
+    }
+    TABLES_INITIALIZED.get_or_init(|| {
+        // SAFETY: `decode_tables_host` points to a host array of NEEDED u32s,
+        // the kernel copies into a static __constant__ symbol of equal size.
+        unsafe { leech_q24_init_tables_ffi(decode_tables.as_ptr(), symbol_set_id) };
+    });
+    Ok(())
+}
+
+/// Decode `n_tiles` tiles from the Q24-tANS bitstream → `out_v` (int8[n_blocks, 24]).
+///
+/// All large buffers are device-allocated raw pointers; the Rust slice lengths
+/// passed in are used as size hints for bounds checks at the host boundary
+/// but the kernel reads / writes purely through the raw pointers.
+///
+/// # Args
+/// - `packed_buckets`: device, 13-bit packed buckets, ≥1 trailing byte pad.
+/// - `tile_states`: device, `[n_tiles] u16` LE.
+/// - `tile_nb_totals`: device, `[n_tiles] u16` LE.
+/// - `tile_bitstream`: device, `[bs_words] u64` LE.
+/// - `tile_bit_offsets`: device, `[n_tiles] u64`, precomputed via
+///   [`compute_tile_bit_offsets`] on host.
+/// - `out_v`: device, `[n_blocks × 24] i8`.
+/// - `n_blocks` / `n_tiles`: tensor block / tile counts.
+/// - `w_offset`: 3 (S=7, ms=13) or 4 (S=9, ms=18).
+/// - `tile_size`: production hard-codes 32; pass 32 here.
+/// - `stream`: cudaStream_t (raw pointer). Pass null for default stream.
+///
+/// # Safety
+/// All pointers must reference device memory of the declared size. The Rust
+/// slice lengths are size hints only.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_q24_decode_v_int(
+    packed_buckets: *const u8,
+    tile_states: *const u16,
+    tile_nb_totals: *const u16,
+    tile_bitstream: *const u64,
+    tile_bit_offsets: *const u64,
+    out_v: *mut i8,
+    n_blocks: u32,
+    n_tiles: u32,
+    w_offset: i32,
+    tile_size: i32,
+    stream: *mut c_void,
+) -> Result<(), LeechQ24DecodeError> {
+    if tile_size != 32 {
+        return Err(LeechQ24DecodeError::UnsupportedTileSize(tile_size));
+    }
+    if !(w_offset == 3 || w_offset == 4) {
+        return Err(LeechQ24DecodeError::UnsupportedWOffset(w_offset));
+    }
+    unsafe {
+        leech_q24_decode_v_int_cuda(
+            packed_buckets,
+            tile_states,
+            tile_nb_totals,
+            tile_bitstream,
+            tile_bit_offsets,
+            out_v,
+            n_blocks,
+            n_tiles,
+            w_offset,
+            tile_size,
+            stream,
+        );
+    }
+    Ok(())
+}

@@ -1,0 +1,23 @@
+[package]
+name = "mistralrs-leech-q24"
+version.workspace = true
+edition.workspace = true
+description = "Container reader for the LEECHQ24 (Forney-Q24 + 4-codebook tANS) .leech v3 weight format."
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+byteorder = "1.5"
+crc32fast = "1.4"
+memmap2 = "0.9"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+half = "2.4"
+
+[dev-dependencies]
+hex = "0.4"
