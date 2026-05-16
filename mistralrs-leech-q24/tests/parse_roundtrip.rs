@@ -12,7 +12,8 @@
 use std::path::PathBuf;
 
 use mistralrs_leech_q24::{
-    bucket_unpack, DtypeTag, LeechQ24File, OpenOptions, Role, FORMAT_VERSION, HEADER_SIZE, MAGIC,
+    bucket_unpack, DtypeTag, LeechQ24File, OpenOptions, Role, FORMAT_VERSION,
+    FORMAT_VERSION_V3_COMPAT, HEADER_SIZE, MAGIC,
 };
 
 fn artifact_path() -> Option<PathBuf> {
@@ -71,14 +72,25 @@ fn magic_constant_is_leechq24() {
 #[test]
 fn header_layout_constants() {
     assert_eq!(HEADER_SIZE, 256);
-    assert_eq!(FORMAT_VERSION, 3);
+    // v1.1 of the plan bumped FORMAT_VERSION 3 → 4; v3 files are still
+    // accepted via the compat shim (see container::TocEntry::unpack).
+    assert_eq!(FORMAT_VERSION, 4);
+    assert_eq!(FORMAT_VERSION_V3_COMPAT, 3);
 }
 
 #[test]
 fn header_parses() {
     let Some(f) = open_artifact() else { return };
     let h = f.header();
-    assert_eq!(h.format_version, FORMAT_VERSION);
+    // The canonical on-disk artifact is the v3 file; the v4-aware loader
+    // reads it via the compat shim, which preserves header.format_version
+    // verbatim (the shim only rewrites TOC entries).
+    assert!(
+        h.format_version == FORMAT_VERSION
+            || h.format_version == FORMAT_VERSION_V3_COMPAT,
+        "header.format_version {} not in {{{FORMAT_VERSION}, {FORMAT_VERSION_V3_COMPAT}}}",
+        h.format_version,
+    );
     assert_eq!(h.header_size, HEADER_SIZE as u32);
     assert!(h.toc_entry_count > 0);
     assert!(h.manifest_size > 0);
@@ -250,6 +262,163 @@ fn first_fp8_passthrough_byte_count_matches_dtype() {
         entry.name,
         entry.shape,
         raw.len()
+    );
+}
+
+#[test]
+fn v3_compat_shim_forces_num_streams_one() {
+    // On a v3 artifact, the v4 loader's compat shim must force num_streams=1
+    // and alias substream_states_offset / substream_nb_totals_offset to the
+    // v3 tile_*_offset values (so downstream CUDA can treat v3 == v4 K=1).
+    let Some(f) = open_artifact() else { return };
+    let h = f.header();
+    if h.format_version != FORMAT_VERSION_V3_COMPAT {
+        println!("SKIP: artifact is not v3 (got fmt={})", h.format_version);
+        return;
+    }
+    let mut checked = 0usize;
+    for e in f.toc() {
+        if !e.is_llvq_tans() {
+            continue;
+        }
+        assert_eq!(
+            e.num_streams, 1,
+            "v3 compat shim must force num_streams=1, got {} for {:?}",
+            e.num_streams, e.name
+        );
+        assert_eq!(
+            e.substream_states_offset, e.tile_states_offset,
+            "v3 substream_states_offset must alias tile_states_offset"
+        );
+        assert_eq!(
+            e.substream_nb_totals_offset, e.tile_nb_totals_offset,
+            "v3 substream_nb_totals_offset must alias tile_nb_totals_offset"
+        );
+        checked += 1;
+        if checked >= 5 {
+            break;
+        }
+    }
+    assert!(checked > 0, "no LLVQ tensors found to validate");
+    println!("v3 compat shim verified on {} LLVQ tensors", checked);
+}
+
+#[test]
+fn v3_compat_payload_aliases_tile_arrays() {
+    // The LlvqTansPayload substream_states / substream_nb_totals slices must
+    // be byte-equal to tile_states / tile_nb_totals for a v3 artifact.
+    let Some(f) = open_artifact() else { return };
+    if f.header().format_version != FORMAT_VERSION_V3_COMPAT {
+        println!("SKIP: artifact is not v3");
+        return;
+    }
+    let (idx, _) = f
+        .toc()
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.is_llvq_tans())
+        .expect("no LLVQ tensor");
+    let p = f.llvq_tans_payload(idx).expect("payload");
+    assert_eq!(p.num_streams, 1);
+    assert_eq!(p.substream_states.len(), p.tile_states.len());
+    assert_eq!(p.substream_nb_totals.len(), p.tile_nb_totals.len());
+    assert_eq!(
+        p.substream_states, p.tile_states,
+        "v3 substream_states must byte-equal tile_states"
+    );
+    assert_eq!(
+        p.substream_nb_totals, p.tile_nb_totals,
+        "v3 substream_nb_totals must byte-equal tile_nb_totals"
+    );
+    println!(
+        "v3 compat payload alias verified ({} tiles)",
+        p.n_tiles
+    );
+}
+
+#[test]
+fn synthetic_v4_toc_entry_parses() {
+    // Construct a synthetic v4 TOC entry byte-buffer with num_streams=4
+    // and verify the parser reads the new fields.
+    use mistralrs_leech_q24::{TocEntry, TOC_ENTRY_SIZE};
+
+    let mut buf = vec![0u8; TOC_ENTRY_SIZE];
+    // name: "synthetic_v4"
+    let name = b"synthetic_v4";
+    buf[..name.len()].copy_from_slice(name);
+    // role=LlvqTans (0)
+    buf[200] = 0;
+    // dtype_tag=Packed (5)
+    buf[201] = 5;
+    // rank=2
+    buf[202..204].copy_from_slice(&2u16.to_le_bytes());
+    // shape[0]=64, shape[1]=24
+    buf[204..208].copy_from_slice(&64u32.to_le_bytes());
+    buf[208..212].copy_from_slice(&24u32.to_le_bytes());
+    // flags=0 @236
+    // symbol_set_id=0 @240
+    // tile_size=32 @244
+    buf[244..248].copy_from_slice(&32u32.to_le_bytes());
+    // k_beta=8 @248
+    buf[248..252].copy_from_slice(&8u32.to_le_bytes());
+    // k_offset=0 @252
+    // R=2 @256
+    buf[256..260].copy_from_slice(&2u32.to_le_bytes());
+    // B=32 @260
+    buf[260..264].copy_from_slice(&32u32.to_le_bytes());
+    // num_streams=4 @264..268
+    buf[264..268].copy_from_slice(&4u32.to_le_bytes());
+    // n_blocks=64 @268
+    buf[268..276].copy_from_slice(&64u64.to_le_bytes());
+    // n_tiles=2 @276
+    buf[276..284].copy_from_slice(&2u64.to_le_bytes());
+    // buckets_offset=0x1000 @284
+    buf[284..292].copy_from_slice(&0x1000u64.to_le_bytes());
+    // tile_states_offset=0x2000 @316
+    buf[316..324].copy_from_slice(&0x2000u64.to_le_bytes());
+    // tile_nb_totals_offset=0x2100 @324
+    buf[324..332].copy_from_slice(&0x2100u64.to_le_bytes());
+    // tile_bitstream_offset=0x3000 @332
+    buf[332..340].copy_from_slice(&0x3000u64.to_le_bytes());
+    // substream_states_offset=0x4000 @428
+    buf[428..436].copy_from_slice(&0x4000u64.to_le_bytes());
+    // substream_nb_totals_offset=0x4100 @436
+    buf[436..444].copy_from_slice(&0x4100u64.to_le_bytes());
+
+    let entry = TocEntry::unpack(&buf, 0, FORMAT_VERSION).expect("parse v4 synthetic");
+    assert_eq!(entry.name, "synthetic_v4");
+    assert_eq!(entry.num_streams, 4);
+    assert_eq!(entry.tile_size, 32);
+    assert_eq!(entry.substream_states_offset, 0x4000);
+    assert_eq!(entry.substream_nb_totals_offset, 0x4100);
+    assert_eq!(entry.tile_states_offset, 0x2000);
+    assert_eq!(entry.tile_nb_totals_offset, 0x2100);
+
+    // Now rebuild with num_streams=24 (NOT a power of two ≤ 32) → must error.
+    let mut bad = buf.clone();
+    bad[264..268].copy_from_slice(&24u32.to_le_bytes());
+    let err = TocEntry::unpack(&bad, 0, FORMAT_VERSION);
+    assert!(err.is_err(), "K=24 must be rejected");
+
+    // num_streams=8 but tile_size=4 (K does not divide T) → must error.
+    let mut bad2 = buf.clone();
+    bad2[264..268].copy_from_slice(&8u32.to_le_bytes());
+    bad2[244..248].copy_from_slice(&4u32.to_le_bytes());
+    let err2 = TocEntry::unpack(&bad2, 0, FORMAT_VERSION);
+    assert!(err2.is_err(), "K=8, T=4 (K not dividing T) must be rejected");
+
+    // Same buffer but read as v3-compat: num_streams must be forced to 1
+    // and substream_*_offset must alias tile_*_offset.
+    let entry_v3 =
+        TocEntry::unpack(&buf, 0, FORMAT_VERSION_V3_COMPAT).expect("parse v3 compat");
+    assert_eq!(entry_v3.num_streams, 1);
+    assert_eq!(
+        entry_v3.substream_states_offset, entry_v3.tile_states_offset,
+        "v3 compat shim must alias substream_states_offset to tile_states_offset"
+    );
+    assert_eq!(
+        entry_v3.substream_nb_totals_offset, entry_v3.tile_nb_totals_offset,
+        "v3 compat shim must alias substream_nb_totals_offset to tile_nb_totals_offset"
     );
 }
 

@@ -17,16 +17,35 @@ use crate::error::{LeechQ24Error, Result};
 use byteorder::{ByteOrder, LittleEndian as LE};
 
 pub const MAGIC: [u8; 8] = *b"LEECHQ24";
-pub const FORMAT_VERSION: u32 = 3;
+/// v4 format: K-parallel FSE sub-streams per tile (see plan
+/// `2026-05-16_q24t_v4_parallel_substreams.md`).
+pub const FORMAT_VERSION: u32 = 4;
+/// v3 files are still accepted via a compat shim that forces `num_streams=1`
+/// and aliases the new `substream_*` offsets to the v3 `tile_*` arrays.
+pub const FORMAT_VERSION_V3_COMPAT: u32 = 3;
 pub const HEADER_SIZE: usize = 256;
 pub const HEADER_STRUCT_SIZE: usize = 128;
 pub const FIXED_PREFIX_SIZE: usize = MAGIC.len() + HEADER_STRUCT_SIZE;
 pub const TOC_ENTRY_SIZE: usize = 448;
-pub const TOC_STRUCT_SIZE: usize = 428;
+/// Used bytes within a TOC entry for v4 (was 428 in v3; the new
+/// `substream_states_offset` / `substream_nb_totals_offset` u64s occupy
+/// bytes 428..444).
+pub const TOC_STRUCT_SIZE: usize = 444;
+pub const TOC_V3_STRUCT_SIZE: usize = 428;
 pub const TENSOR_NAME_BYTES: usize = 200;
 pub const SHAPE_MAX_DIMS: usize = 8;
 pub const ALIGN: u64 = 64;
 pub const SENTINEL_BUCKET: u16 = 0xFFFF;
+
+/// v4 `num_streams` is restricted to powers of two ≤ 32 that divide every
+/// supported `tile_size`. The CUDA dispatch + warp-reduce path is only
+/// instantiated for these values.
+pub const SUPPORTED_NUM_STREAMS: &[u32] = &[1, 2, 4, 8, 16, 32];
+
+/// Check whether `K` is a valid v4 `num_streams`.
+pub fn is_supported_num_streams(k: u32) -> bool {
+    SUPPORTED_NUM_STREAMS.iter().any(|&v| v == k)
+}
 
 /// Tensor role tag (TOC byte +200).
 #[repr(u8)]
@@ -181,8 +200,9 @@ impl Header {
     }
 }
 
-/// One TOC entry (448 bytes on disk; 428 used + 20 reserved pad).
-/// Mirrors `TOC_STRUCT` in container.py.
+/// One TOC entry (448 bytes on disk).
+/// v3: 428 used + 20 pad. v4: 444 used + 4 pad. Mirrors `TOC_STRUCT` /
+/// `TOC_V3_STRUCT` in container.py.
 #[derive(Debug, Clone)]
 pub struct TocEntry {
     pub name: String,
@@ -198,6 +218,11 @@ pub struct TocEntry {
     pub k_offset: u32,
     pub r: u32,
     pub b: u32,
+    /// v4 only: K = number of FSE sub-streams per tile. Always 1 for v3 files
+    /// (forced by the compat shim regardless of byte content at offset 264..268).
+    /// LLVQ tensors must have `num_streams ∈ SUPPORTED_NUM_STREAMS`; other
+    /// roles ignore this field.
+    pub num_streams: u32,
 
     // LLVQ_TANS-only:
     pub n_blocks: u64,
@@ -222,14 +247,38 @@ pub struct TocEntry {
     // Passthrough/overlay only:
     pub passthrough_offset: u64,
     pub passthrough_size: u64,
+
+    /// v4 NEW: file offset of the `[n_tiles, K] u16` substream starting states.
+    /// In v3 compat mode this aliases `tile_states_offset`.
+    pub substream_states_offset: u64,
+    /// v4 NEW: file offset of the `[n_tiles, K] u16` per-substream nb totals.
+    /// In v3 compat mode this aliases `tile_nb_totals_offset`.
+    pub substream_nb_totals_offset: u64,
 }
 
 impl TocEntry {
-    pub fn unpack(buf: &[u8], idx: usize) -> Result<Self> {
-        if buf.len() < TOC_STRUCT_SIZE {
+    /// Parse one TOC entry. `format_version` MUST be one of
+    /// [`FORMAT_VERSION`] (v4) or [`FORMAT_VERSION_V3_COMPAT`] (v3); the
+    /// loader checks this before calling. The version drives the compat shim:
+    ///
+    /// - v3: `num_streams` is forced to 1 regardless of the byte content at
+    ///   offset 264..268 (which held `reserved_u32 = 0` in v3 writers). The
+    ///   two v4 substream offsets alias `tile_states_offset` /
+    ///   `tile_nb_totals_offset` (so a downstream payload reader can use the
+    ///   same code path for both versions).
+    /// - v4: `num_streams` is read from offset 264..268 and asserted to be in
+    ///   [`SUPPORTED_NUM_STREAMS`] for LLVQ tensors. The new offsets are read
+    ///   from bytes 428..436 and 436..444.
+    pub fn unpack(buf: &[u8], idx: usize, format_version: u32) -> Result<Self> {
+        let min_size = if format_version == FORMAT_VERSION_V3_COMPAT {
+            TOC_V3_STRUCT_SIZE
+        } else {
+            TOC_STRUCT_SIZE
+        };
+        if buf.len() < min_size {
             return Err(LeechQ24Error::BadTocEntry {
                 idx,
-                reason: format!("entry too short: {} < {}", buf.len(), TOC_STRUCT_SIZE),
+                reason: format!("entry too short: {} < {}", buf.len(), min_size),
             });
         }
         let name_raw = &buf[0..TENSOR_NAME_BYTES];
@@ -270,7 +319,8 @@ impl TocEntry {
         let k_offset = LE::read_u32(&buf[252..256]);
         let r = LE::read_u32(&buf[256..260]);
         let b = LE::read_u32(&buf[260..264]);
-        // [264..268] reserved_u32
+        // [264..268] is `reserved_u32` in v3 (always 0) and `num_streams` in v4.
+        let raw_num_streams = LE::read_u32(&buf[264..268]);
         let n_blocks = LE::read_u64(&buf[268..276]);
         let n_tiles = LE::read_u64(&buf[276..284]);
         let buckets_offset = LE::read_u64(&buf[284..292]);
@@ -293,6 +343,48 @@ impl TocEntry {
         let passthrough_offset = LE::read_u64(&buf[412..420]);
         let passthrough_size = LE::read_u64(&buf[420..428]);
 
+        // ── v3 vs v4 compat shim ─────────────────────────────────────
+        // Version-check FIRST (the format_version arg), then byte-read SECOND.
+        // For v3 we ignore raw_num_streams (it's `reserved_u32 = 0` and would
+        // cause div-by-zero downstream) and force num_streams = 1, aliasing
+        // the new substream_* offsets to the v3 tile_* arrays. This makes a
+        // v3 file decode-equivalent to a v4 K=1 file from the consumer's view.
+        let (num_streams, substream_states_offset, substream_nb_totals_offset) =
+            if format_version == FORMAT_VERSION_V3_COMPAT {
+                (1u32, tile_states_offset, tile_nb_totals_offset)
+            } else {
+                // v4: read the new offsets and validate num_streams.
+                let sub_states = LE::read_u64(&buf[428..436]);
+                let sub_nb = LE::read_u64(&buf[436..444]);
+                if role == Role::LlvqTans {
+                    debug_assert!(
+                        raw_num_streams > 0,
+                        "v4 TocEntry must have num_streams > 0"
+                    );
+                    if !is_supported_num_streams(raw_num_streams) {
+                        return Err(LeechQ24Error::BadTocEntry {
+                            idx,
+                            reason: format!(
+                                "v4 num_streams must be in {{1,2,4,8,16,32}}, got {raw_num_streams}"
+                            ),
+                        });
+                    }
+                    if tile_size > 0 && (tile_size as u32) % raw_num_streams != 0 {
+                        return Err(LeechQ24Error::BadTocEntry {
+                            idx,
+                            reason: format!(
+                                "v4 num_streams {raw_num_streams} must divide tile_size {tile_size}"
+                            ),
+                        });
+                    }
+                    (raw_num_streams, sub_states, sub_nb)
+                } else {
+                    // Non-LLVQ entries: the K field is meaningless; normalize to 1.
+                    let k = if raw_num_streams == 0 { 1 } else { raw_num_streams };
+                    (k, sub_states, sub_nb)
+                }
+            };
+
         Ok(TocEntry {
             name,
             role,
@@ -306,6 +398,7 @@ impl TocEntry {
             k_offset,
             r,
             b,
+            num_streams,
             n_blocks,
             n_tiles,
             buckets_offset,
@@ -326,6 +419,8 @@ impl TocEntry {
             offset_lloyd_bytes,
             passthrough_offset,
             passthrough_size,
+            substream_states_offset,
+            substream_nb_totals_offset,
         })
     }
 
@@ -368,7 +463,19 @@ mod tests {
         assert_eq!(HEADER_SIZE, 256);
         assert_eq!(HEADER_STRUCT_SIZE, 128);
         assert_eq!(TOC_ENTRY_SIZE, 448);
-        assert_eq!(TOC_STRUCT_SIZE, 428);
+        // v4 TOC entry: 444 used + 4 pad. v3 compat: 428 used + 20 pad.
+        assert_eq!(TOC_STRUCT_SIZE, 444);
+        assert_eq!(TOC_V3_STRUCT_SIZE, 428);
+    }
+
+    #[test]
+    fn supported_num_streams_set() {
+        for &k in SUPPORTED_NUM_STREAMS {
+            assert!(is_supported_num_streams(k));
+        }
+        for k in [0u32, 3, 5, 6, 7, 9, 12, 24, 33, 64] {
+            assert!(!is_supported_num_streams(k), "K={k} unexpectedly supported");
+        }
     }
 
     #[test]

@@ -31,8 +31,9 @@ use memmap2::Mmap;
 
 pub use codebook::{parse_codebook_blob, CodebookSet, DecodeEntry, M_TABLE, N_CODEBOOKS, TABLE_LOG};
 pub use container::{
-    validate_role_dtype, DtypeTag, Header, Role, TocEntry, FIXED_PREFIX_SIZE, FORMAT_VERSION,
-    HEADER_SIZE, MAGIC, SENTINEL_BUCKET, TOC_ENTRY_SIZE,
+    is_supported_num_streams, validate_role_dtype, DtypeTag, Header, Role, TocEntry,
+    FIXED_PREFIX_SIZE, FORMAT_VERSION, FORMAT_VERSION_V3_COMPAT, HEADER_SIZE, MAGIC,
+    SENTINEL_BUCKET, SUPPORTED_NUM_STREAMS, TOC_ENTRY_SIZE,
 };
 pub use error::{LeechQ24Error, Result};
 pub use payload::LlvqTansPayload;
@@ -94,7 +95,10 @@ impl LeechQ24File {
             return Err(LeechQ24Error::BadMagic { got: magic });
         }
         let header = Header::unpack(&bytes[8..8 + container::HEADER_STRUCT_SIZE])?;
-        if header.format_version != FORMAT_VERSION {
+        // v4 readers accept v3 files via the compat shim (see container::TocEntry::unpack).
+        if header.format_version != FORMAT_VERSION
+            && header.format_version != FORMAT_VERSION_V3_COMPAT
+        {
             return Err(LeechQ24Error::UnsupportedVersion(header.format_version));
         }
         if header.header_size as usize != HEADER_SIZE {
@@ -141,7 +145,11 @@ impl LeechQ24File {
         let mut toc = Vec::with_capacity(toc_count);
         for i in 0..toc_count {
             let start = i * TOC_ENTRY_SIZE;
-            let entry = TocEntry::unpack(&toc_buf[start..start + TOC_ENTRY_SIZE], i)?;
+            let entry = TocEntry::unpack(
+                &toc_buf[start..start + TOC_ENTRY_SIZE],
+                i,
+                header.format_version,
+            )?;
             if opts.validate_toc {
                 validate_role_dtype(entry.role, entry.dtype_tag).map_err(|_| {
                     LeechQ24Error::BadTocEntry {

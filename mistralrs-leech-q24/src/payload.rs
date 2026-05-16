@@ -19,8 +19,11 @@ pub struct LlvqTansPayload<'a> {
     /// Empty when `sentinel_count == 0`.
     pub sentinel_indices: &'a [u8],
     /// `tile_states[n_tiles]` — final tANS state offset per tile, u16 LE.
+    /// In v4 this is `substream_states[t, 0]` for the sub-stream-0 path; the
+    /// host should prefer `substream_states` for new code.
     pub tile_states: &'a [u8],
     /// `tile_nb_totals[n_tiles]` — bitstream bit-count per tile, u16 LE.
+    /// In v4 this equals `Σ_k substream_nb_totals[t, k]`.
     pub tile_nb_totals: &'a [u8],
     /// `tile_bitstream[tile_bitstream_words]` — concatenated u64 LE words.
     pub tile_bitstream: &'a [u8],
@@ -35,6 +38,16 @@ pub struct LlvqTansPayload<'a> {
     /// `k_offset == 0`.
     pub offset_lloyd: &'a [u8],
 
+    /// v4: `substream_states[n_tiles, K]` — starting state for each sub-stream
+    /// in each tile, u16 LE, tile-major. At K=1 this is byte-equal to
+    /// [`Self::tile_states`]; the v3 compat shim makes it ALIAS the tile array
+    /// (same byte range).
+    pub substream_states: &'a [u8],
+    /// v4: `substream_nb_totals[n_tiles, K]` — bit count for each sub-stream
+    /// in each tile, u16 LE, tile-major. Sum across K equals
+    /// [`Self::tile_nb_totals`]`[t]`. At K=1 this aliases `tile_nb_totals`.
+    pub substream_nb_totals: &'a [u8],
+
     pub n_blocks: u64,
     pub n_tiles: u64,
     pub tile_bitstream_words: u64,
@@ -45,6 +58,8 @@ pub struct LlvqTansPayload<'a> {
     pub b: u32,
     pub k_beta: u32,
     pub k_offset: u32,
+    /// v4: number of FSE sub-streams per tile. K=1 for v3 files (compat shim).
+    pub num_streams: u32,
 }
 
 impl<'a> LlvqTansPayload<'a> {
@@ -127,6 +142,12 @@ pub(crate) fn build_llvq_tans_payload<'a>(
     } else {
         &[]
     };
+    // v4: substream arrays. The v3 compat shim aliases these offsets to the
+    // tile_* arrays (so the slice equals tile_states / tile_nb_totals byte-for-byte
+    // for v3 files), and forces num_streams = 1.
+    let sub_bytes = entry.n_tiles * (entry.num_streams as u64) * 2;
+    let substream_states = sl(entry.substream_states_offset, sub_bytes)?;
+    let substream_nb_totals = sl(entry.substream_nb_totals_offset, sub_bytes)?;
 
     Ok(LlvqTansPayload {
         buckets_packed,
@@ -138,6 +159,8 @@ pub(crate) fn build_llvq_tans_payload<'a>(
         offset_idx_packed,
         beta_lloyd,
         offset_lloyd,
+        substream_states,
+        substream_nb_totals,
         n_blocks: entry.n_blocks,
         n_tiles: entry.n_tiles,
         tile_bitstream_words: entry.tile_bitstream_words,
@@ -148,6 +171,7 @@ pub(crate) fn build_llvq_tans_payload<'a>(
         b: entry.b,
         k_beta: entry.k_beta,
         k_offset: entry.k_offset,
+        num_streams: entry.num_streams,
     })
 }
 
