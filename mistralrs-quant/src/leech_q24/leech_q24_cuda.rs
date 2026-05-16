@@ -8,7 +8,9 @@ use std::ffi::c_void;
 use std::fmt;
 use std::sync::OnceLock;
 
-use crate::leech_q24::ffi::{leech_q24_decode_v_int_cuda, leech_q24_init_tables_ffi};
+use crate::leech_q24::ffi::{
+    leech_q24_decode_v_int_cuda, leech_q24_gemv_bf16_cuda, leech_q24_init_tables_ffi,
+};
 
 /// Sticky one-shot init guard. Subsequent `init_tables` calls with the SAME
 /// `symbol_set_id` are a no-op; with a DIFFERENT `symbol_set_id`, the second
@@ -152,6 +154,93 @@ pub unsafe fn leech_q24_decode_v_int(
             n_tiles,
             w_offset,
             tile_size,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Phase B.0 fused decode + β·v + offset + GEMV → bf16 (batch M=1).
+///
+/// All large buffers are device pointers. The Rust side does not interpret
+/// any of them — it only enforces tile_size and w_offset are supported and
+/// forwards to the C kernel.
+///
+/// # Args
+/// - `a_act_bf16_ptr`: device, `[K_total]` bf16 (K_total = b_blocks * 24).
+/// - `packed_buckets`, `tile_states`, `tile_nb_totals`, `tile_bitstream`,
+///   `tile_bit_offsets`: same as the decode-only path.
+/// - `beta_idx_packed`: device, `[n_blocks]` 3-bit packed.
+/// - `offset_idx_packed`: device, `[n_blocks]` 3-bit packed; pass null when
+///   `has_offset == false`.
+/// - `beta_lloyd_ptr`: device, `[R, k_beta]` f32.
+/// - `offset_lloyd_ptr`: device, `[R, k_offset]` f32; pass null when no offset.
+/// - `y_acc_f32_ptr`: device scratch, `[R]` f32. The kernel zero-fills before
+///   the atomicAdd pass; caller need not pre-zero.
+/// - `out_y_bf16_ptr`: device, `[R]` bf16. The narrowed result.
+/// - `r_rows`, `b_blocks`, `n_blocks`, `n_tiles`, `k_beta`, `k_offset`:
+///   tensor dimensions.
+/// - `w_offset`: 3 (S=7, ms=13) or 4 (S=9, ms=18).
+/// - `tile_size`: production hard-codes 32.
+/// - `has_offset`: 0 or 1.
+/// - `stream`: cudaStream_t; null for default.
+///
+/// # Safety
+/// All pointers must reference device memory of the declared size.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_q24_gemv_bf16(
+    a_act_bf16_ptr: *const c_void,
+    packed_buckets: *const u8,
+    tile_states: *const u16,
+    tile_nb_totals: *const u16,
+    tile_bitstream: *const u64,
+    tile_bit_offsets: *const u64,
+    beta_idx_packed: *const u8,
+    offset_idx_packed: *const u8,
+    beta_lloyd_ptr: *const f32,
+    offset_lloyd_ptr: *const f32,
+    y_acc_f32_ptr: *mut f32,
+    out_y_bf16_ptr: *mut c_void,
+    r_rows: u32,
+    b_blocks: u32,
+    n_blocks: u32,
+    n_tiles: u32,
+    k_beta: u32,
+    k_offset: u32,
+    w_offset: i32,
+    tile_size: i32,
+    has_offset: bool,
+    stream: *mut c_void,
+) -> Result<(), LeechQ24DecodeError> {
+    if tile_size != 32 {
+        return Err(LeechQ24DecodeError::UnsupportedTileSize(tile_size));
+    }
+    if !(w_offset == 3 || w_offset == 4) {
+        return Err(LeechQ24DecodeError::UnsupportedWOffset(w_offset));
+    }
+    unsafe {
+        leech_q24_gemv_bf16_cuda(
+            a_act_bf16_ptr,
+            packed_buckets,
+            tile_states,
+            tile_nb_totals,
+            tile_bitstream,
+            tile_bit_offsets,
+            beta_idx_packed,
+            offset_idx_packed,
+            beta_lloyd_ptr,
+            offset_lloyd_ptr,
+            y_acc_f32_ptr,
+            out_y_bf16_ptr,
+            r_rows,
+            b_blocks,
+            n_blocks,
+            n_tiles,
+            k_beta,
+            k_offset,
+            w_offset,
+            tile_size,
+            if has_offset { 1 } else { 0 },
             stream,
         );
     }

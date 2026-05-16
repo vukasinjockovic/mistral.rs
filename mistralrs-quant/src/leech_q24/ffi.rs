@@ -51,4 +51,35 @@ extern "C" {
         tile_size: i32,
         stream: *mut c_void,
     );
+
+    /// Phase B.0 fused decode + β·v + offset + GEMV → bf16 output (batch M=1).
+    ///
+    /// All buffers are device pointers. The kernel atomicAdds into a per-row
+    /// f32 accumulator, then a tiny finalize kernel converts f32 → bf16 into
+    /// `out_y_bf16` (R bf16 values). The accumulator scratch is caller-owned
+    /// (device-allocated, sized for R floats).
+    pub(crate) fn leech_q24_gemv_bf16_cuda(
+        a_act_bf16: *const c_void,
+        packed_buckets: *const u8,
+        tile_states: *const u16,
+        tile_nb_totals: *const u16,
+        tile_bitstream: *const u64,
+        tile_bit_offsets: *const u64,
+        beta_idx_packed: *const u8,
+        offset_idx_packed: *const u8,
+        beta_lloyd: *const f32,
+        offset_lloyd: *const f32,
+        y_acc_f32: *mut f32,
+        out_y_bf16: *mut c_void,
+        r_rows: u32,
+        b_blocks: u32,
+        n_blocks: u32,
+        n_tiles: u32,
+        k_beta: u32,
+        k_offset: u32,
+        w_offset: i32,
+        tile_size: i32,
+        has_offset: i32,
+        stream: *mut c_void,
+    );
 }
