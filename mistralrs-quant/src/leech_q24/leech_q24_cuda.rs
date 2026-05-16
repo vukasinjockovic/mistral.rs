@@ -137,7 +137,7 @@ pub unsafe fn leech_q24_decode_v_int(
     tile_size: i32,
     stream: *mut c_void,
 ) -> Result<(), LeechQ24DecodeError> {
-    if tile_size != 32 {
+    if !matches!(tile_size, 4 | 8 | 16 | 32) {
         return Err(LeechQ24DecodeError::UnsupportedTileSize(tile_size));
     }
     if !(w_offset == 3 || w_offset == 4) {
@@ -213,7 +213,7 @@ pub unsafe fn leech_q24_gemv_bf16(
     has_offset: bool,
     stream: *mut c_void,
 ) -> Result<(), LeechQ24DecodeError> {
-    if tile_size != 32 {
+    if !matches!(tile_size, 4 | 8 | 16 | 32) {
         return Err(LeechQ24DecodeError::UnsupportedTileSize(tile_size));
     }
     if !(w_offset == 3 || w_offset == 4) {

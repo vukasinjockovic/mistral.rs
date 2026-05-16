@@ -30,6 +30,7 @@
 //   verifies this before calling init_tables.
 
 #include <cstdint>
+#include <cstdio>
 #include <cuda_bf16.h>
 #include "leech_q24_bucket_extract.cuh"
 #include "leech_q24_pattern_table.h"
@@ -159,13 +160,44 @@ extern "C" void leech_q24_decode_v_int_cuda(
     constexpr int THREADS_PER_BLOCK = 128;
     uint32_t grid = (n_tiles + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
-    // Production path: TILE_SIZE = 32. Other sizes fall through to 32 with a
-    // warning at the Rust layer (no other size in production today).
-    (void)tile_size;
-    leech_q24_decode_kernel<32><<<grid, THREADS_PER_BLOCK, 0, s>>>(
-        packed_buckets, tile_states, tile_nb_totals, tile_bitstream,
-        tile_bit_offsets, out_v, n_blocks, n_tiles, w_offset
-    );
+    // Runtime dispatch over supported TILE_SIZE values. Encoded artifacts may
+    // choose T ∈ {4, 8, 16, 32}; the kernel is templated on T so all four
+    // variants are instantiated here. Unsupported values fall back to T=32.
+    switch (tile_size) {
+        case 4:
+            leech_q24_decode_kernel<4><<<grid, THREADS_PER_BLOCK, 0, s>>>(
+                packed_buckets, tile_states, tile_nb_totals, tile_bitstream,
+                tile_bit_offsets, out_v, n_blocks, n_tiles, w_offset
+            );
+            break;
+        case 8:
+            leech_q24_decode_kernel<8><<<grid, THREADS_PER_BLOCK, 0, s>>>(
+                packed_buckets, tile_states, tile_nb_totals, tile_bitstream,
+                tile_bit_offsets, out_v, n_blocks, n_tiles, w_offset
+            );
+            break;
+        case 16:
+            leech_q24_decode_kernel<16><<<grid, THREADS_PER_BLOCK, 0, s>>>(
+                packed_buckets, tile_states, tile_nb_totals, tile_bitstream,
+                tile_bit_offsets, out_v, n_blocks, n_tiles, w_offset
+            );
+            break;
+        case 32:
+            leech_q24_decode_kernel<32><<<grid, THREADS_PER_BLOCK, 0, s>>>(
+                packed_buckets, tile_states, tile_nb_totals, tile_bitstream,
+                tile_bit_offsets, out_v, n_blocks, n_tiles, w_offset
+            );
+            break;
+        default:
+            fprintf(stderr,
+                "leech_q24: unsupported tile_size=%d in decode_v_int, "
+                "falling back to T=32\n", tile_size);
+            leech_q24_decode_kernel<32><<<grid, THREADS_PER_BLOCK, 0, s>>>(
+                packed_buckets, tile_states, tile_nb_totals, tile_bitstream,
+                tile_bit_offsets, out_v, n_blocks, n_tiles, w_offset
+            );
+            break;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -379,18 +411,79 @@ extern "C" void leech_q24_gemv_bf16_cuda(
     cudaMemsetAsync(y_acc_f32, 0, (size_t)r_rows * sizeof(float), s);
     constexpr int THREADS = 128;
     uint32_t grid = (n_tiles + THREADS - 1) / THREADS;
-    (void)tile_size;
-    leech_q24_gemv_bf16_kernel<32><<<grid, THREADS, 0, s>>>(
-        reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
-        packed_buckets, tile_states, tile_nb_totals,
-        tile_bitstream, tile_bit_offsets,
-        beta_idx_packed, offset_idx_packed,
-        beta_lloyd, offset_lloyd,
-        y_acc_f32,
-        r_rows, b_blocks, n_blocks, n_tiles,
-        k_beta, k_offset,
-        w_offset, has_offset
-    );
+    // Runtime dispatch over supported TILE_SIZE values. Encoded artifacts may
+    // choose T ∈ {4, 8, 16, 32}; the kernel is templated on T so all four
+    // variants are instantiated here. Unsupported values fall back to T=32.
+    switch (tile_size) {
+        case 4:
+            leech_q24_gemv_bf16_kernel<4><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset
+            );
+            break;
+        case 8:
+            leech_q24_gemv_bf16_kernel<8><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset
+            );
+            break;
+        case 16:
+            leech_q24_gemv_bf16_kernel<16><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset
+            );
+            break;
+        case 32:
+            leech_q24_gemv_bf16_kernel<32><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset
+            );
+            break;
+        default:
+            fprintf(stderr,
+                "leech_q24: unsupported tile_size=%d in gemv_bf16, "
+                "falling back to T=32\n", tile_size);
+            leech_q24_gemv_bf16_kernel<32><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset
+            );
+            break;
+    }
     uint32_t fgrid = (r_rows + THREADS - 1) / THREADS;
     leech_q24_finalize_f32_to_bf16_kernel<<<fgrid, THREADS, 0, s>>>(
         y_acc_f32,
