@@ -1028,6 +1028,11 @@ __global__ void leech_q24_gemv_bf16_no_pat_kernel(
                 uint32_t sym  = entry & 0xFFu;
                 uint32_t nb   = (entry >> 8) & 0xFFu;
                 uint32_t base = entry >> 16;
+                // SAFETY-for-subtractive: nb_left can become arbitrarily negative
+                // when the state chain pulls junk entries; clamp so the LDG.E.64
+                // address stays inside the bitstream. Same per-iter cost.
+                if (nb > 32u) nb = 32u;
+                if (nb_left < (int32_t)nb) nb_left = (int32_t)nb;
                 uint32_t bits_val = extract_nb_bits_from_window(
                     tile_bitstream, bit_off, nb_left, nb);
                 nb_left -= (int32_t)nb;
@@ -1138,6 +1143,9 @@ __global__ void leech_q24_gemv_bf16_no_decode_kernel(
                 uint32_t sym  = entry & 0xFFu;
                 uint32_t nb   = (entry >> 8) & 0xFFu;
                 uint32_t base = entry >> 16;
+                // SAFETY-for-subtractive: clamp nb / nb_left so LDG.E.64 stays in-bounds.
+                if (nb > 32u) nb = 32u;
+                if (nb_left < (int32_t)nb) nb_left = (int32_t)nb;
                 uint32_t bits_val = extract_nb_bits_from_window(
                     tile_bitstream, bit_off, nb_left, nb);
                 nb_left -= (int32_t)nb;
@@ -1587,6 +1595,11 @@ __global__ void leech_q24_gemv_bf16_no_state_kernel(
                 uint32_t sym  = entry & 0xFFu;
                 uint32_t nb   = (entry >> 8) & 0xFFu;
                 uint32_t base = entry >> 16;
+                // SAFETY-for-subtractive: clamp nb / nb_left. With state pinned
+                // to 0 the sum-of-nb across coords no longer equals
+                // tile_nb_totals[tid], so nb_left can underflow.
+                if (nb > 32u) nb = 32u;
+                if (nb_left < (int32_t)nb) nb_left = (int32_t)nb;
                 uint32_t bits_val = extract_nb_bits_from_window(
                     tile_bitstream, bit_off, nb_left, nb);
                 nb_left -= (int32_t)nb;
