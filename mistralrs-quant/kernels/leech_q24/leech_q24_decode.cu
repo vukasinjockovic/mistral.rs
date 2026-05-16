@@ -367,4 +367,186 @@ extern "C" void leech_q24_gemv_bf16_cuda(
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Phase B.1 — warp-cooperative fused GEMV.
+//
+// Commit 1 (scaffold): the kernel body is a verbatim copy of
+// `leech_q24_gemv_bf16_kernel` above. The launcher uses the same launch
+// geometry. This commit only proves the FFI/test plumbing is correct; bench
+// MUST match v0 within noise (~2290 µs). Commits 2-5 progressively swap in
+// the warp-cooperative design from
+// thoughts/shared/plans/2026-05-16_q24t_gemv_phase_b1_warpcoop_rewrite.md.
+//
+// v0 (`leech_q24_gemv_bf16_kernel`, `leech_q24_gemv_bf16_cuda`) stays intact
+// throughout the rewrite; runtime selection lives in the Rust caller via the
+// `LEECHQ24_WARPCOOP` env var.
+// ─────────────────────────────────────────────────────────────────────────
+
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_warpcoop_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
+
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+
+        float partial = 0.0f;
+
+        #pragma unroll
+        for (int j = 0; j < COORDS_PER_BLOCK; ++j) {
+            uint32_t pat_j = pat_row[j];
+            uint32_t cb = (parity << 1) | pat_j;
+            uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+            uint32_t sym  = entry & 0xFFu;
+            uint32_t nb   = (entry >> 8) & 0xFFu;
+            uint32_t base = entry >> 16;
+
+            uint32_t bits_val = 0;
+            for (uint32_t k = 0; k < nb; ++k) {
+                int32_t  pos = nb_left - 1 - (int32_t)k;
+                uint64_t abs_bit = bit_off + (uint64_t)pos;
+                uint64_t word = tile_bitstream[abs_bit >> 6];
+                uint32_t bit_idx = (uint32_t)(abs_bit & 63ull);
+                uint32_t bit = (uint32_t)((word >> bit_idx) & 1ull);
+                bits_val = (bits_val << 1) | bit;
+            }
+            nb_left -= (int32_t)nb;
+            state = (base | bits_val) & M_MASK;
+
+            int32_t w_int = (int32_t)sym - w_offset;
+            int32_t c_low = (parity == 0u)
+                ? ((int32_t)pat_j << 1)
+                : ((pat_j != 0u) ? -1 : 1);
+            int32_t v_int = c_low + 4 * w_int;
+
+            float w_val = beta_val * (float)v_int + offset_val;
+            float a_f32 = __bfloat162float(a_act[k_base + j]);
+            partial += w_val * a_f32;
+        }
+
+        acc_val[slot] += partial;
+    }
+
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+        }
+    }
+}
+
+extern "C" void leech_q24_gemv_bf16_warpcoop_cuda(
+    const void*     a_act_bf16,
+    const uint8_t*  packed_buckets,
+    const uint16_t* tile_states,
+    const uint16_t* tile_nb_totals,
+    const uint64_t* tile_bitstream,
+    const uint64_t* tile_bit_offsets,
+    const uint8_t*  beta_idx_packed,
+    const uint8_t*  offset_idx_packed,
+    const float*    beta_lloyd,
+    const float*    offset_lloyd,
+    float*          y_acc_f32,
+    void*           out_y_bf16,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  tile_size,
+    int32_t  has_offset,
+    void*    stream
+) {
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    cudaMemsetAsync(y_acc_f32, 0, (size_t)r_rows * sizeof(float), s);
+    constexpr int THREADS = 128;
+    uint32_t grid = (n_tiles + THREADS - 1) / THREADS;
+    (void)tile_size;
+    leech_q24_gemv_bf16_warpcoop_kernel<32><<<grid, THREADS, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+        packed_buckets, tile_states, tile_nb_totals,
+        tile_bitstream, tile_bit_offsets,
+        beta_idx_packed, offset_idx_packed,
+        beta_lloyd, offset_lloyd,
+        y_acc_f32,
+        r_rows, b_blocks, n_blocks, n_tiles,
+        k_beta, k_offset,
+        w_offset, has_offset
+    );
+    uint32_t fgrid = (r_rows + THREADS - 1) / THREADS;
+    leech_q24_finalize_f32_to_bf16_kernel<<<fgrid, THREADS, 0, s>>>(
+        y_acc_f32,
+        reinterpret_cast<__nv_bfloat16*>(out_y_bf16),
+        r_rows
+    );
+}
+
 } // namespace leech_q24
