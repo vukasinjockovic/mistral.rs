@@ -493,6 +493,336 @@ extern "C" void leech_q24_gemv_bf16_cuda(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Instrumented variant: per-stage clock64() profiling of the v0 GEMV kernel.
+//
+// Brackets 8 per-coord-step operations with clock64() and accumulates cycles
+// into a per-thread uint64_t cyc[8] array. At end-of-kernel each thread
+// atomicAdds its accumulators into a single global [8] array. Output is
+// IDENTICAL to v0 (no semantic changes; only timing brackets added).
+//
+// Stages (per coord unless noted):
+//   0: bucket_extract + split_bucket (per BLOCK, not per coord)
+//   1: pat_row[j] load
+//   2: c_decode_tables[cb * M_TABLE + state] lookup
+//   3: extract_nb_bits_from_window (the Path A batch u64 read)
+//   4: state = (base | bits_val) & M_MASK
+//   5: a_act[k_base + j] load + __bfloat162float cast
+//   6: partial += w_val * a_f32
+//   7: end-of-tile atomicAdd (per TILE, not per coord)
+//
+// Anti-reorder strategy: We use `asm volatile("" : : "l"(x) : "memory")` as a
+// barrier between the producer op and the clock64 read, forcing the compiler
+// to materialize the op before the timer stops. clock64() compiles to a
+// non-reorderable SR.CLOCKLO/HI read on Blackwell sm_120.
+//
+// Overhead: ~6-10 cycles per clock64. With 8 reads/coord × 24 coords ×
+// TILE_SIZE blocks × 522,240 tiles at T=4 → ~3.2 G clock reads → ~16 µs added
+// to wall time at 1.4 GHz / 170 SMs. Negligible vs 1427 µs envelope.
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace detail {
+__device__ __forceinline__ void clk_barrier_u32(uint32_t v) {
+    // Force the compiler to materialize `v` before this point; opaque to LLVM.
+    asm volatile("" : : "r"(v) : "memory");
+}
+__device__ __forceinline__ void clk_barrier_u64(uint64_t v) {
+    asm volatile("" : : "l"(v) : "memory");
+}
+__device__ __forceinline__ void clk_barrier_f32(float v) {
+    asm volatile("" : : "f"(v) : "memory");
+}
+} // namespace detail
+
+template<int TILE_SIZE>
+__global__ void leech_q24_gemv_bf16_timed_kernel(
+    const __nv_bfloat16* __restrict__ a_act,
+    const uint8_t*  __restrict__ packed_buckets,
+    const uint16_t* __restrict__ tile_states,
+    const uint16_t* __restrict__ tile_nb_totals,
+    const uint64_t* __restrict__ tile_bitstream,
+    const uint64_t* __restrict__ tile_bit_offsets,
+    const uint8_t*  __restrict__ beta_idx_packed,
+    const uint8_t*  __restrict__ offset_idx_packed,
+    const float*    __restrict__ beta_lloyd,
+    const float*    __restrict__ offset_lloyd,
+    float*          __restrict__ y_acc_f32,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  has_offset,
+    uint64_t* __restrict__ stage_cycles_out      // [N_STAGES] global accumulator
+) {
+    constexpr int N_STAGES = 8;
+    uint64_t cyc[N_STAGES] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tiles) return;
+
+    uint32_t state = (uint32_t)tile_states[tid];
+    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
+    uint64_t bit_off = tile_bit_offsets[tid];
+
+    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
+    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end > n_blocks) tile_end = n_blocks;
+
+    float    acc_val[2] = {0.0f, 0.0f};
+    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
+    int32_t  acc_count = 0;
+
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        // ── Stage 0: bucket extract + split (PER BLOCK) ──────────────────
+        uint64_t t0_pre = clock64();
+        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+        uint32_t parity, h, f;
+        split_bucket(bucket, parity, h, f);
+        detail::clk_barrier_u32(parity);
+        detail::clk_barrier_u32(h);
+        detail::clk_barrier_u32(f);
+        uint64_t t0_post = clock64();
+        cyc[0] += t0_post - t0_pre;
+
+        const uint8_t* pat_row =
+            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
+
+        uint32_t row = bi / b_blocks;
+        uint32_t col_block = bi - row * b_blocks;
+        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
+
+        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
+        float offset_val = 0.0f;
+        if (has_offset) {
+            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
+            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
+        }
+
+        int32_t slot = -1;
+        #pragma unroll
+        for (int32_t s = 0; s < 2; ++s) {
+            if (s < acc_count && acc_row[s] == row) { slot = s; }
+        }
+        if (slot < 0) {
+            slot = acc_count;
+            if (slot >= 2) {
+                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
+                acc_row[0] = acc_row[1];
+                acc_val[0] = acc_val[1];
+                slot = 1;
+            }
+            acc_row[slot] = row;
+            acc_val[slot] = 0.0f;
+            if (acc_count < 2) acc_count++;
+        }
+
+        float partial = 0.0f;
+
+        // NOTE: NOT unrolled here — unrolling makes 24 separate clock64()
+        // brackets per coord, blowing up per-stage cycle counts in ways that
+        // are hard to reason about. The compiler may still partially unroll;
+        // we accept that for measurement purposes.
+        for (int j = 0; j < COORDS_PER_BLOCK; ++j) {
+            // ── Stage 1: pat_row[j] load ────────────────────────────────
+            uint64_t t1_pre = clock64();
+            uint32_t pat_j = pat_row[j];
+            detail::clk_barrier_u32(pat_j);
+            uint64_t t1_post = clock64();
+            cyc[1] += t1_post - t1_pre;
+
+            uint32_t cb = (parity << 1) | pat_j;
+
+            // ── Stage 2: c_decode_tables[cb * M_TABLE + state] lookup ──
+            uint64_t t2_pre = clock64();
+            uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+            detail::clk_barrier_u32(entry);
+            uint64_t t2_post = clock64();
+            cyc[2] += t2_post - t2_pre;
+
+            uint32_t sym  = entry & 0xFFu;
+            uint32_t nb   = (entry >> 8) & 0xFFu;
+            uint32_t base = entry >> 16;
+
+            // ── Stage 3: extract_nb_bits_from_window (Path A batch read) ─
+            uint64_t t3_pre = clock64();
+            uint32_t bits_val = extract_nb_bits_from_window(
+                tile_bitstream, bit_off, nb_left, nb);
+            detail::clk_barrier_u32(bits_val);
+            uint64_t t3_post = clock64();
+            cyc[3] += t3_post - t3_pre;
+
+            nb_left -= (int32_t)nb;
+
+            // ── Stage 4: state = (base | bits_val) & M_MASK ─────────────
+            uint64_t t4_pre = clock64();
+            state = (base | bits_val) & M_MASK;
+            detail::clk_barrier_u32(state);
+            uint64_t t4_post = clock64();
+            cyc[4] += t4_post - t4_pre;
+
+            int32_t w_int = (int32_t)sym - w_offset;
+            int32_t c_low = (parity == 0u)
+                ? ((int32_t)pat_j << 1)
+                : ((pat_j != 0u) ? -1 : 1);
+            int32_t v_int = c_low + 4 * w_int;
+            float w_val = beta_val * (float)v_int + offset_val;
+
+            // ── Stage 5: a_act load + bf16→f32 cast ─────────────────────
+            uint64_t t5_pre = clock64();
+            float a_f32 = __bfloat162float(a_act[k_base + j]);
+            detail::clk_barrier_f32(a_f32);
+            uint64_t t5_post = clock64();
+            cyc[5] += t5_post - t5_pre;
+
+            // ── Stage 6: FMA partial += w_val * a_f32 ───────────────────
+            uint64_t t6_pre = clock64();
+            partial += w_val * a_f32;
+            detail::clk_barrier_f32(partial);
+            uint64_t t6_post = clock64();
+            cyc[6] += t6_post - t6_pre;
+        }
+
+        acc_val[slot] += partial;
+    }
+
+    // ── Stage 7: end-of-tile atomicAdd (PER TILE) ──────────────────────
+    uint64_t t7_pre = clock64();
+    #pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        if (s < acc_count) {
+            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+        }
+    }
+    uint64_t t7_post = clock64();
+    cyc[7] += t7_post - t7_pre;
+
+    // ── Flush per-thread accumulators into the global [8] array ───────
+    #pragma unroll
+    for (int s = 0; s < N_STAGES; ++s) {
+        atomicAdd(
+            reinterpret_cast<unsigned long long*>(&stage_cycles_out[s]),
+            (unsigned long long)cyc[s]
+        );
+    }
+}
+
+extern "C" void leech_q24_gemv_bf16_timed_cuda(
+    const void*     a_act_bf16,
+    const uint8_t*  packed_buckets,
+    const uint16_t* tile_states,
+    const uint16_t* tile_nb_totals,
+    const uint64_t* tile_bitstream,
+    const uint64_t* tile_bit_offsets,
+    const uint8_t*  beta_idx_packed,
+    const uint8_t*  offset_idx_packed,
+    const float*    beta_lloyd,
+    const float*    offset_lloyd,
+    float*          y_acc_f32,
+    void*           out_y_bf16,
+    uint32_t r_rows,
+    uint32_t b_blocks,
+    uint32_t n_blocks,
+    uint32_t n_tiles,
+    uint32_t k_beta,
+    uint32_t k_offset,
+    int32_t  w_offset,
+    int32_t  tile_size,
+    int32_t  has_offset,
+    uint64_t* stage_cycles_out,                  // device [8]
+    void*    stream
+) {
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    cudaMemsetAsync(y_acc_f32, 0, (size_t)r_rows * sizeof(float), s);
+    cudaMemsetAsync(stage_cycles_out, 0, 8 * sizeof(uint64_t), s);
+    constexpr int THREADS = 128;
+    uint32_t grid = (n_tiles + THREADS - 1) / THREADS;
+    switch (tile_size) {
+        case 4:
+            leech_q24_gemv_bf16_timed_kernel<4><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset,
+                stage_cycles_out
+            );
+            break;
+        case 8:
+            leech_q24_gemv_bf16_timed_kernel<8><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset,
+                stage_cycles_out
+            );
+            break;
+        case 16:
+            leech_q24_gemv_bf16_timed_kernel<16><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset,
+                stage_cycles_out
+            );
+            break;
+        case 32:
+            leech_q24_gemv_bf16_timed_kernel<32><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset,
+                stage_cycles_out
+            );
+            break;
+        default:
+            fprintf(stderr,
+                "leech_q24: unsupported tile_size=%d in gemv_bf16_timed, "
+                "falling back to T=32\n", tile_size);
+            leech_q24_gemv_bf16_timed_kernel<32><<<grid, THREADS, 0, s>>>(
+                reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
+                packed_buckets, tile_states, tile_nb_totals,
+                tile_bitstream, tile_bit_offsets,
+                beta_idx_packed, offset_idx_packed,
+                beta_lloyd, offset_lloyd,
+                y_acc_f32,
+                r_rows, b_blocks, n_blocks, n_tiles,
+                k_beta, k_offset,
+                w_offset, has_offset,
+                stage_cycles_out
+            );
+            break;
+    }
+    uint32_t fgrid = (r_rows + THREADS - 1) / THREADS;
+    leech_q24_finalize_f32_to_bf16_kernel<<<fgrid, THREADS, 0, s>>>(
+        y_acc_f32,
+        reinterpret_cast<__nv_bfloat16*>(out_y_bf16),
+        r_rows
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Phase B.1 — warp-cooperative fused GEMV.
 //
 // Design: one warp owns one tile. Lane 0 drives the serial FSE state chain

@@ -83,6 +83,47 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    /// Instrumented v0 fused GEMV — same semantics as `leech_q24_gemv_bf16_cuda`
+    /// but accumulates per-stage cycle counts into `stage_cycles_out` (device
+    /// pointer to a `[u64; 8]` buffer). Stages, in order:
+    ///
+    /// 0. bucket_extract + split_bucket (per BLOCK)
+    /// 1. pat_row[j] load
+    /// 2. c_decode_tables[cb * M_TABLE + state] lookup
+    /// 3. extract_nb_bits_from_window (Path A batch u64 read)
+    /// 4. state = (base | bits_val) & M_MASK
+    /// 5. a_act load + bf16→f32 cast
+    /// 6. partial += w_val * a_f32
+    /// 7. end-of-tile atomicAdd (per TILE)
+    ///
+    /// Output is identical to v0 (timing brackets only). Wall time is ~5-10%
+    /// slower than v0 due to clock64 reads (~16 µs added at T=4 scale).
+    pub(crate) fn leech_q24_gemv_bf16_timed_cuda(
+        a_act_bf16: *const c_void,
+        packed_buckets: *const u8,
+        tile_states: *const u16,
+        tile_nb_totals: *const u16,
+        tile_bitstream: *const u64,
+        tile_bit_offsets: *const u64,
+        beta_idx_packed: *const u8,
+        offset_idx_packed: *const u8,
+        beta_lloyd: *const f32,
+        offset_lloyd: *const f32,
+        y_acc_f32: *mut f32,
+        out_y_bf16: *mut c_void,
+        r_rows: u32,
+        b_blocks: u32,
+        n_blocks: u32,
+        n_tiles: u32,
+        k_beta: u32,
+        k_offset: u32,
+        w_offset: i32,
+        tile_size: i32,
+        has_offset: i32,
+        stage_cycles_out: *mut u64,
+        stream: *mut c_void,
+    );
+
     /// Phase B.1 warp-cooperative fused GEMV. Same signature as
     /// `leech_q24_gemv_bf16_cuda`. Selectable at runtime by the caller
     /// (env-var `LEECHQ24_WARPCOOP` in tests / `LeechLayer` flag in the

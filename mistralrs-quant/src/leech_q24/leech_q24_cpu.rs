@@ -88,6 +88,35 @@ pub unsafe fn leech_q24_gemv_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_q24_gemv_bf16_timed(
+    _a_act_bf16_ptr: *const c_void,
+    _packed_buckets: *const u8,
+    _tile_states: *const u16,
+    _tile_nb_totals: *const u16,
+    _tile_bitstream: *const u64,
+    _tile_bit_offsets: *const u64,
+    _beta_idx_packed: *const u8,
+    _offset_idx_packed: *const u8,
+    _beta_lloyd_ptr: *const f32,
+    _offset_lloyd_ptr: *const f32,
+    _y_acc_f32_ptr: *mut f32,
+    _out_y_bf16_ptr: *mut c_void,
+    _r_rows: u32,
+    _b_blocks: u32,
+    _n_blocks: u32,
+    _n_tiles: u32,
+    _k_beta: u32,
+    _k_offset: u32,
+    _w_offset: i32,
+    _tile_size: i32,
+    _has_offset: bool,
+    _stage_cycles_out: *mut u64,
+    _stream: *mut c_void,
+) -> Result<(), LeechQ24DecodeError> {
+    Err(LeechQ24DecodeError::CpuNotImplemented)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn leech_q24_gemv_bf16_warpcoop(
     _a_act_bf16_ptr: *const c_void,
     _packed_buckets: *const u8,

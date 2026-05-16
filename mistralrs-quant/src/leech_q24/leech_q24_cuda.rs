@@ -10,7 +10,8 @@ use std::sync::OnceLock;
 
 use crate::leech_q24::ffi::{
     leech_q24_decode_v_int_cuda, leech_q24_gemv_bf16_cuda,
-    leech_q24_gemv_bf16_warpcoop_cuda, leech_q24_init_tables_ffi,
+    leech_q24_gemv_bf16_timed_cuda, leech_q24_gemv_bf16_warpcoop_cuda,
+    leech_q24_init_tables_ffi,
 };
 
 /// Sticky one-shot init guard. Subsequent `init_tables` calls with the SAME
@@ -242,6 +243,79 @@ pub unsafe fn leech_q24_gemv_bf16(
             w_offset,
             tile_size,
             if has_offset { 1 } else { 0 },
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Instrumented v0 fused GEMV — same outputs as [`leech_q24_gemv_bf16`] but
+/// also writes per-stage cycle counts into `stage_cycles_out` (device pointer
+/// to `[u64; 8]`). See [`crate::leech_q24::ffi::leech_q24_gemv_bf16_timed_cuda`]
+/// for the stage numbering.
+///
+/// `stage_cycles_out` must point to a device-allocated buffer of at least
+/// 8 × u64. The kernel zeroes it before launch and atomicAdds per-thread
+/// cycle accumulators into it.
+///
+/// # Safety
+/// All pointers must reference device memory of the declared size.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn leech_q24_gemv_bf16_timed(
+    a_act_bf16_ptr: *const c_void,
+    packed_buckets: *const u8,
+    tile_states: *const u16,
+    tile_nb_totals: *const u16,
+    tile_bitstream: *const u64,
+    tile_bit_offsets: *const u64,
+    beta_idx_packed: *const u8,
+    offset_idx_packed: *const u8,
+    beta_lloyd_ptr: *const f32,
+    offset_lloyd_ptr: *const f32,
+    y_acc_f32_ptr: *mut f32,
+    out_y_bf16_ptr: *mut c_void,
+    r_rows: u32,
+    b_blocks: u32,
+    n_blocks: u32,
+    n_tiles: u32,
+    k_beta: u32,
+    k_offset: u32,
+    w_offset: i32,
+    tile_size: i32,
+    has_offset: bool,
+    stage_cycles_out: *mut u64,
+    stream: *mut c_void,
+) -> Result<(), LeechQ24DecodeError> {
+    if !matches!(tile_size, 4 | 8 | 16 | 32) {
+        return Err(LeechQ24DecodeError::UnsupportedTileSize(tile_size));
+    }
+    if !(w_offset == 3 || w_offset == 4) {
+        return Err(LeechQ24DecodeError::UnsupportedWOffset(w_offset));
+    }
+    unsafe {
+        leech_q24_gemv_bf16_timed_cuda(
+            a_act_bf16_ptr,
+            packed_buckets,
+            tile_states,
+            tile_nb_totals,
+            tile_bitstream,
+            tile_bit_offsets,
+            beta_idx_packed,
+            offset_idx_packed,
+            beta_lloyd_ptr,
+            offset_lloyd_ptr,
+            y_acc_f32_ptr,
+            out_y_bf16_ptr,
+            r_rows,
+            b_blocks,
+            n_blocks,
+            n_tiles,
+            k_beta,
+            k_offset,
+            w_offset,
+            tile_size,
+            if has_offset { 1 } else { 0 },
+            stage_cycles_out,
             stream,
         );
     }
