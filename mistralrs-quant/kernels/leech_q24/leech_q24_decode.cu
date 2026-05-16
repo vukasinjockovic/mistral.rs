@@ -370,17 +370,44 @@ extern "C" void leech_q24_gemv_bf16_cuda(
 // ─────────────────────────────────────────────────────────────────────────
 // Phase B.1 — warp-cooperative fused GEMV.
 //
-// Commit 1 (scaffold): the kernel body is a verbatim copy of
-// `leech_q24_gemv_bf16_kernel` above. The launcher uses the same launch
-// geometry. This commit only proves the FFI/test plumbing is correct; bench
-// MUST match v0 within noise (~2290 µs). Commits 2-5 progressively swap in
-// the warp-cooperative design from
-// thoughts/shared/plans/2026-05-16_q24t_gemv_phase_b1_warpcoop_rewrite.md.
+// Design: one warp owns one tile. Lane 0 drives the serial FSE state chain
+// (768 dependent updates per tile) into per-block scratch in SMEM; lanes
+// 0..23 each consume one coord per block via an FMA into a per-lane f32
+// register, then warp-reduce + atomicAdd into y_acc_f32[row] at tile end.
 //
-// v0 (`leech_q24_gemv_bf16_kernel`, `leech_q24_gemv_bf16_cuda`) stays intact
-// throughout the rewrite; runtime selection lives in the Rust caller via the
-// `LEECHQ24_WARPCOOP` env var.
+// 4 warps/block, 128 threads/block, grid = ceil(n_tiles / 4). Replaces
+// v0's 510-block × 128-thread grid with 16,320 × 128 = 32× more blocks,
+// taking warp residency from 18.75% → 75%.
+//
+// Commit 2 (current): Mode B work distribution with the v0 per-bit
+// extract loop still on lane 0. Bench target: 600-800 µs.
+// Commit 3 will replace the per-bit loop with a uint4 shift-window.
+//
+// v0 (`leech_q24_gemv_bf16_kernel`, `leech_q24_gemv_bf16_cuda`) stays
+// intact throughout the rewrite; runtime selection lives in the Rust
+// caller via the `LEECHQ24_WARPCOOP` env var.
 // ─────────────────────────────────────────────────────────────────────────
+
+constexpr int WARPCOOP_BLOCK_THREADS = 128;
+constexpr int WARPCOOP_WARPS_PER_BLOCK = WARPCOOP_BLOCK_THREADS / 32;
+constexpr int WARPCOOP_K_BETA_MAX = 8;     // production k_beta == 8
+constexpr int WARPCOOP_K_OFFSET_MAX = 8;   // production k_offset == 8
+constexpr int WARPCOOP_TILE_SIZE = 32;     // production tile_size
+
+// Per-warp SMEM slab. One per warp in a block.
+struct alignas(16) WarpTile {
+    // coord_pack[j] holds the int8 v_int for coord j of the *current* block
+    // being consumed (packed into a u32 for store/load convenience). Only
+    // entries [0..24) are read by the consumer lanes; [24..32) are padding
+    // for alignment.
+    uint32_t coord_pack[32];                            // 128 B
+
+    // β / offset Lloyd row centroids, refreshed by lane 0 on row change.
+    float    beta_lloyd_row[WARPCOOP_K_BETA_MAX];       //  32 B
+    float    offset_lloyd_row[WARPCOOP_K_OFFSET_MAX];   //  32 B
+};
+static_assert(sizeof(WarpTile) <= 2048,
+              "per-warp SMEM exceeds 2 KB budget");
 
 template<int TILE_SIZE>
 __global__ void leech_q24_gemv_bf16_warpcoop_kernel(
@@ -404,100 +431,165 @@ __global__ void leech_q24_gemv_bf16_warpcoop_kernel(
     int32_t  w_offset,
     int32_t  has_offset
 ) {
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_tiles) return;
+    extern __shared__ uint8_t s_raw[];
+    const int WARP_ID = (int)(threadIdx.x >> 5);
+    const int LANE    = (int)(threadIdx.x & 31);
+    const uint32_t TILE = blockIdx.x * (uint32_t)WARPCOOP_WARPS_PER_BLOCK
+                          + (uint32_t)WARP_ID;
+    if (TILE >= n_tiles) return;
 
-    uint32_t state = (uint32_t)tile_states[tid];
-    int32_t  nb_left = (int32_t)tile_nb_totals[tid];
-    uint64_t bit_off = tile_bit_offsets[tid];
+    WarpTile* WT = reinterpret_cast<WarpTile*>(s_raw) + WARP_ID;
 
-    uint32_t tile_start = tid * (uint32_t)TILE_SIZE;
-    uint32_t tile_end = tile_start + (uint32_t)TILE_SIZE;
-    if (tile_end > n_blocks) tile_end = n_blocks;
-
-    float    acc_val[2] = {0.0f, 0.0f};
-    uint32_t acc_row[2] = {UINT32_MAX, UINT32_MAX};
-    int32_t  acc_count = 0;
-
-    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
-        uint32_t bucket = extract_bucket_13(packed_buckets, bi);
-        uint32_t parity, h, f;
-        split_bucket(bucket, parity, h, f);
-        const uint8_t* pat_row =
-            &d_pattern_table[(h * 64 + f) * COORDS_PER_BLOCK];
-
-        uint32_t row = bi / b_blocks;
-        uint32_t col_block = bi - row * b_blocks;
-        uint32_t k_base = col_block * (uint32_t)COORDS_PER_BLOCK;
-
-        uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
-        float beta_val = beta_lloyd[row * k_beta + beta_idx_val];
-        float offset_val = 0.0f;
-        if (has_offset) {
-            uint32_t offset_idx_val = extract_3bit_q24(offset_idx_packed, bi);
-            offset_val = offset_lloyd[row * k_offset + offset_idx_val];
-        }
-
-        int32_t slot = -1;
-        #pragma unroll
-        for (int32_t s = 0; s < 2; ++s) {
-            if (s < acc_count && acc_row[s] == row) { slot = s; }
-        }
-        if (slot < 0) {
-            slot = acc_count;
-            if (slot >= 2) {
-                atomicAdd(&y_acc_f32[acc_row[0]], acc_val[0]);
-                acc_row[0] = acc_row[1];
-                acc_val[0] = acc_val[1];
-                slot = 1;
-            }
-            acc_row[slot] = row;
-            acc_val[slot] = 0.0f;
-            if (acc_count < 2) acc_count++;
-        }
-
-        float partial = 0.0f;
-
-        #pragma unroll
-        for (int j = 0; j < COORDS_PER_BLOCK; ++j) {
-            uint32_t pat_j = pat_row[j];
-            uint32_t cb = (parity << 1) | pat_j;
-            uint32_t entry = c_decode_tables[cb * M_TABLE + state];
-            uint32_t sym  = entry & 0xFFu;
-            uint32_t nb   = (entry >> 8) & 0xFFu;
-            uint32_t base = entry >> 16;
-
-            uint32_t bits_val = 0;
-            for (uint32_t k = 0; k < nb; ++k) {
-                int32_t  pos = nb_left - 1 - (int32_t)k;
-                uint64_t abs_bit = bit_off + (uint64_t)pos;
-                uint64_t word = tile_bitstream[abs_bit >> 6];
-                uint32_t bit_idx = (uint32_t)(abs_bit & 63ull);
-                uint32_t bit = (uint32_t)((word >> bit_idx) & 1ull);
-                bits_val = (bits_val << 1) | bit;
-            }
-            nb_left -= (int32_t)nb;
-            state = (base | bits_val) & M_MASK;
-
-            int32_t w_int = (int32_t)sym - w_offset;
-            int32_t c_low = (parity == 0u)
-                ? ((int32_t)pat_j << 1)
-                : ((pat_j != 0u) ? -1 : 1);
-            int32_t v_int = c_low + 4 * w_int;
-
-            float w_val = beta_val * (float)v_int + offset_val;
-            float a_f32 = __bfloat162float(a_act[k_base + j]);
-            partial += w_val * a_f32;
-        }
-
-        acc_val[slot] += partial;
+    // Lane 0 owns the serial state chain; non-zero lanes only do FMA.
+    uint32_t state    = 0;
+    int32_t  nb_left  = 0;
+    uint64_t bit_off  = 0;
+    if (LANE == 0) {
+        state    = (uint32_t)tile_states[TILE];
+        nb_left  = (int32_t)tile_nb_totals[TILE];
+        bit_off  = tile_bit_offsets[TILE];
     }
 
-    #pragma unroll
-    for (int s = 0; s < 2; ++s) {
-        if (s < acc_count) {
-            atomicAdd(&y_acc_f32[acc_row[s]], acc_val[s]);
+    // Per-lane f32 row partial. Lanes 24..31 stay 0 (warp-reduce harmless).
+    float    lane_acc = 0.0f;
+    // Row currently held in WT->beta_lloyd_row[] / WT->offset_lloyd_row[].
+    // UINT32_MAX = sentinel "no row loaded yet"; the first block of every
+    // tile trips the straddle path and loads the centroids for row 0 of
+    // the tile through the same code path as a mid-tile reload (single-
+    // path centroid loading; see plan §2.10.2).
+    uint32_t cur_row = UINT32_MAX;
+
+    const uint32_t tile_start = TILE * (uint32_t)TILE_SIZE;
+    uint32_t tile_end_raw = tile_start + (uint32_t)TILE_SIZE;
+    if (tile_end_raw > n_blocks) tile_end_raw = n_blocks;
+    const uint32_t tile_end = tile_end_raw;
+
+    for (uint32_t bi = tile_start; bi < tile_end; ++bi) {
+        // ── Lane-0 phase 1: bucket + row/col compute (β/offset DEFERRED) ─
+        uint32_t row_b = 0, col_b = 0;
+        uint32_t parity_b = 0, h_b = 0, f_b = 0;
+        if (LANE == 0) {
+            uint32_t bucket = extract_bucket_13(packed_buckets, bi);
+            split_bucket(bucket, parity_b, h_b, f_b);
+            row_b = bi / b_blocks;
+            col_b = bi - row_b * b_blocks;
         }
+        // Broadcast row_b BEFORE the straddle handshake; needed by every
+        // lane to decide whether to participate in the butterfly reduce.
+        row_b = __shfl_sync(0xFFFFFFFFu, row_b, 0);
+
+        // ── Mid-tile row-straddle handshake (uniform across warp) ────────
+        // On the first block of the tile, cur_row == UINT32_MAX, so this
+        // path fires once and loads centroids for row_b through the same
+        // code path as a mid-tile reload. The atomicAdd is suppressed via
+        // the cur_row != UINT32_MAX guard.
+        bool straddle = (row_b != cur_row);
+        if (straddle) {
+            float v = lane_acc;
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                v += __shfl_xor_sync(0xFFFFFFFFu, v, mask);
+            }
+            if (LANE == 0 && cur_row != UINT32_MAX) {
+                atomicAdd(&y_acc_f32[cur_row], v);
+            }
+            lane_acc = 0.0f;
+            __syncwarp(0xFFFFFFFFu);
+            if (LANE == 0) {
+                #pragma unroll
+                for (int k = 0; k < WARPCOOP_K_BETA_MAX; ++k) {
+                    WT->beta_lloyd_row[k] = (k < (int)k_beta)
+                        ? beta_lloyd[row_b * k_beta + (uint32_t)k]
+                        : 0.0f;
+                }
+                if (has_offset) {
+                    #pragma unroll
+                    for (int k = 0; k < WARPCOOP_K_OFFSET_MAX; ++k) {
+                        WT->offset_lloyd_row[k] = (k < (int)k_offset)
+                            ? offset_lloyd[row_b * k_offset + (uint32_t)k]
+                            : 0.0f;
+                    }
+                }
+                cur_row = row_b;
+            }
+            __syncwarp(0xFFFFFFFFu);
+            cur_row = __shfl_sync(0xFFFFFFFFu, cur_row, 0);
+        }
+
+        // ── Lane-0 phase 2: β/offset SMEM read (now fresh) + state chain ─
+        float beta_b = 0.0f, offset_b = 0.0f;
+        if (LANE == 0) {
+            uint32_t beta_idx_val = extract_3bit_q24(beta_idx_packed, bi);
+            beta_b = WT->beta_lloyd_row[beta_idx_val];
+            offset_b = 0.0f;
+            if (has_offset) {
+                uint32_t oi = extract_3bit_q24(offset_idx_packed, bi);
+                offset_b = WT->offset_lloyd_row[oi];
+            }
+
+            // Locate the pattern row for this (h, f).
+            const uint8_t* pat_row =
+                &d_pattern_table[(h_b * 64 + f_b) * COORDS_PER_BLOCK];
+
+            // 24-coord serial state chain. Per-bit extract loop is the v0
+            // form; Commit 3 replaces it with a uint4 shift-window.
+            #pragma unroll
+            for (int j = 0; j < COORDS_PER_BLOCK; ++j) {
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb    = (parity_b << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym   = entry & 0xFFu;
+                uint32_t nb    = (entry >>  8) & 0xFFu;
+                uint32_t base  = entry >> 16;
+
+                uint32_t bits_val = 0;
+                for (uint32_t k = 0; k < nb; ++k) {
+                    int32_t  pos     = nb_left - 1 - (int32_t)k;
+                    uint64_t abs_bit = bit_off + (uint64_t)pos;
+                    uint64_t word    = tile_bitstream[abs_bit >> 6];
+                    uint32_t bit_idx = (uint32_t)(abs_bit & 63ull);
+                    uint32_t bit     = (uint32_t)((word >> bit_idx) & 1ull);
+                    bits_val = (bits_val << 1) | bit;
+                }
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity_b == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                // Store as sign-extended int32 (consumer re-narrows). High
+                // bits are don't-care; |v_int| ≤ 23 so cast-back is safe.
+                WT->coord_pack[j] = (uint32_t)(int32_t)v_int;
+            }
+        }
+
+        // ── Publish coord_pack[] + broadcast scalars to consumer lanes ───
+        __syncwarp(0xFFFFFFFFu);
+        col_b    = __shfl_sync(0xFFFFFFFFu, col_b, 0);
+        beta_b   = __shfl_sync(0xFFFFFFFFu, beta_b, 0);
+        offset_b = __shfl_sync(0xFFFFFFFFu, offset_b, 0);
+
+        // ── Consumer phase: 24 lanes each do one FMA ─────────────────────
+        if (LANE < COORDS_PER_BLOCK) {
+            int32_t v_int = (int32_t)WT->coord_pack[LANE];
+            float   w_val = beta_b * (float)v_int + offset_b;
+            uint32_t k_idx = col_b * (uint32_t)COORDS_PER_BLOCK + (uint32_t)LANE;
+            float   a_f32 = __bfloat162float(a_act[k_idx]);
+            lane_acc += w_val * a_f32;
+        }
+    }
+    __syncwarp(0xFFFFFFFFu);
+
+    // ── Epilogue: butterfly-reduce lane_acc, atomicAdd into y_acc_f32 ────
+    float v = lane_acc;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        v += __shfl_xor_sync(0xFFFFFFFFu, v, mask);
+    }
+    if (LANE == 0 && cur_row != UINT32_MAX) {
+        atomicAdd(&y_acc_f32[cur_row], v);
     }
 }
 
@@ -527,10 +619,15 @@ extern "C" void leech_q24_gemv_bf16_warpcoop_cuda(
 ) {
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     cudaMemsetAsync(y_acc_f32, 0, (size_t)r_rows * sizeof(float), s);
-    constexpr int THREADS = 128;
-    uint32_t grid = (n_tiles + THREADS - 1) / THREADS;
     (void)tile_size;
-    leech_q24_gemv_bf16_warpcoop_kernel<32><<<grid, THREADS, 0, s>>>(
+
+    const uint32_t grid =
+        (n_tiles + (uint32_t)WARPCOOP_WARPS_PER_BLOCK - 1)
+        / (uint32_t)WARPCOOP_WARPS_PER_BLOCK;
+    const size_t smem_bytes =
+        (size_t)WARPCOOP_WARPS_PER_BLOCK * sizeof(WarpTile);
+    leech_q24_gemv_bf16_warpcoop_kernel<WARPCOOP_TILE_SIZE>
+        <<<grid, WARPCOOP_BLOCK_THREADS, smem_bytes, s>>>(
         reinterpret_cast<const __nv_bfloat16*>(a_act_bf16),
         packed_buckets, tile_states, tile_nb_totals,
         tile_bitstream, tile_bit_offsets,
@@ -541,8 +638,10 @@ extern "C" void leech_q24_gemv_bf16_warpcoop_cuda(
         k_beta, k_offset,
         w_offset, has_offset
     );
-    uint32_t fgrid = (r_rows + THREADS - 1) / THREADS;
-    leech_q24_finalize_f32_to_bf16_kernel<<<fgrid, THREADS, 0, s>>>(
+
+    constexpr int FINAL_THREADS = 128;
+    const uint32_t fgrid = (r_rows + FINAL_THREADS - 1) / FINAL_THREADS;
+    leech_q24_finalize_f32_to_bf16_kernel<<<fgrid, FINAL_THREADS, 0, s>>>(
         y_acc_f32,
         reinterpret_cast<__nv_bfloat16*>(out_y_bf16),
         r_rows
