@@ -37,8 +37,11 @@ fn unpack_3bit(packed: &[u8], i: usize) -> u8 {
     let bit_pos = i * 3;
     let bi = bit_pos >> 3;
     let bo = (bit_pos & 7) as u32;
-    let v = (packed[bi] as u32) | ((packed[bi + 1] as u32) << 8);
-    ((v >> bo) & 0x7) as u8
+    // Tail block: bi+1 may be one past the end when bo+3 ≤ 8 (no span). Treat
+    // missing byte as 0 — the high bits are masked off anyway.
+    let b0 = packed[bi] as u32;
+    let b1 = packed.get(bi + 1).copied().unwrap_or(0) as u32;
+    ((((b0 | (b1 << 8)) >> bo) & 0x7) as u8)
 }
 
 #[test]
