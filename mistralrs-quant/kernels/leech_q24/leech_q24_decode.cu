@@ -685,7 +685,13 @@ __global__ void leech_q24_gemv_bf16_v4_kernel(
     const uint32_t tile_lane0 = warp_lane - k;
     // Mask of the K lanes belonging to this tile (K consecutive lanes
     // starting at tile_lane0). K divides 32, so this fits in 32 bits.
-    const uint32_t mask = ((1u << K) - 1u) << tile_lane0;
+    //
+    // CAREFUL: at K=32, `(1u << K) - 1u` is `1u << 32`, which is UB in C++
+    // (and on Blackwell PTX usually evaluates to 0 because the shift count is
+    // taken mod 32). Special-case K=32 to a full-warp 0xFFFFFFFFu mask.
+    const uint32_t mask = (K == 32)
+        ? 0xFFFFFFFFu
+        : (((1u << K) - 1u) << tile_lane0);
 
     // Step 1: lane k=0 owns the canonical (row_a, row_b) for the tile.
     uint32_t row_a = __shfl_sync(mask, acc_row[0], tile_lane0);
