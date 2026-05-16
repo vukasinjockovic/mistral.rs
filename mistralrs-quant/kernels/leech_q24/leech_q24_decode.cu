@@ -188,6 +188,40 @@ __device__ __forceinline__ uint32_t extract_3bit_q24(
     return (v >> bo) & 0x7u;
 }
 
+// Path A: single-u64 batch read of `nb` bits ending at absolute bit
+// position (bit_off + nb_left - 1), inclusive. Equivalent to v0's
+// per-bit serial loop with bit_idx LSB-first within u64 word and
+// MSB-first assembly into bits_val. Replaces the ~721
+// LDG.E.64.CONSTANT-per-thread scoreboard chain in the GEMV inner loop
+// with one batch read per symbol (plus one more on cross-word
+// straddles).
+//
+// CPU bit-equivalence proven in
+// `mistralrs-quant/tests/leech_q24_bit_extract.rs` over 1M random
+// (bit_off, nb_left, nb) triples and the §2.6 oracle.
+__device__ __forceinline__ uint32_t extract_nb_bits_from_window(
+    const uint64_t* __restrict__ tile_bitstream,
+    uint64_t bit_off,
+    int32_t  nb_left,
+    uint32_t nb)
+{
+    uint64_t low_pos  = bit_off + (uint64_t)nb_left - (uint64_t)nb;
+    uint64_t word_idx = low_pos >> 6;
+    uint32_t bit_idx  = (uint32_t)(low_pos & 63ull);
+    uint64_t w0       = tile_bitstream[word_idx];
+    uint64_t bits;
+    if (bit_idx + nb <= 64u) {
+        bits = (w0 >> bit_idx) & ((1ull << nb) - 1ull);
+    } else {
+        uint64_t w1     = tile_bitstream[word_idx + 1];
+        uint32_t lo_n   = 64u - bit_idx;
+        uint64_t lo_bits = (w0 >> bit_idx);
+        uint64_t hi_bits = (w1 & ((1ull << (nb - lo_n)) - 1ull)) << lo_n;
+        bits = lo_bits | hi_bits;
+    }
+    return (uint32_t)bits;
+}
+
 template<int TILE_SIZE>
 __global__ void leech_q24_gemv_bf16_kernel(
     const __nv_bfloat16* __restrict__ a_act,
@@ -275,15 +309,13 @@ __global__ void leech_q24_gemv_bf16_kernel(
             uint32_t nb   = (entry >> 8) & 0xFFu;
             uint32_t base = entry >> 16;
 
-            uint32_t bits_val = 0;
-            for (uint32_t k = 0; k < nb; ++k) {
-                int32_t  pos = nb_left - 1 - (int32_t)k;
-                uint64_t abs_bit = bit_off + (uint64_t)pos;
-                uint64_t word = tile_bitstream[abs_bit >> 6];
-                uint32_t bit_idx = (uint32_t)(abs_bit & 63ull);
-                uint32_t bit = (uint32_t)((word >> bit_idx) & 1ull);
-                bits_val = (bits_val << 1) | bit;
-            }
+            // Path A: batch u64 bit-extract — replaces v0's per-bit
+            // serial inner loop (1 dependent LDG.E.64.CONSTANT per bit,
+            // ~721/thread scoreboard chain) with one batch read per
+            // symbol (+1 on cross-word straddle). Bit-equivalence vs
+            // v0 proven in tests/leech_q24_bit_extract.rs.
+            uint32_t bits_val = extract_nb_bits_from_window(
+                tile_bitstream, bit_off, nb_left, nb);
             nb_left -= (int32_t)nb;
             state = (base | bits_val) & M_MASK;
 
