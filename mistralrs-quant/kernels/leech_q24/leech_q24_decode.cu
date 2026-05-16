@@ -332,34 +332,68 @@ __global__ void leech_q24_gemv_bf16_kernel(
 
         float partial = 0.0f;
 
+        // bf16x2-vectorized a_act loads: one __nv_bfloat162 (32-bit LDG.E.32)
+        // serves coords (j2, j2+1). The FSE state chain remains coord-by-coord
+        // serial — only the activation load and FMA input are vectorized.
+        // Alignment: k_base = col_block * 24, 24 is even → &a_act[k_base+j2]
+        // for j2 ∈ {0,2,...,22} is 4-byte aligned. COORDS_PER_BLOCK=24 is
+        // even → no tail iteration needed.
         #pragma unroll
-        for (int j = 0; j < COORDS_PER_BLOCK; ++j) {
-            uint32_t pat_j = pat_row[j];
-            uint32_t cb = (parity << 1) | pat_j;
-            uint32_t entry = c_decode_tables[cb * M_TABLE + state];
-            uint32_t sym  = entry & 0xFFu;
-            uint32_t nb   = (entry >> 8) & 0xFFu;
-            uint32_t base = entry >> 16;
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
 
-            // Path A: batch u64 bit-extract — replaces v0's per-bit
-            // serial inner loop (1 dependent LDG.E.64.CONSTANT per bit,
-            // ~721/thread scoreboard chain) with one batch read per
-            // symbol (+1 on cross-word straddle). Bit-equivalence vs
-            // v0 proven in tests/leech_q24_bit_extract.rs.
-            uint32_t bits_val = extract_nb_bits_from_window(
-                tile_bitstream, bit_off, nb_left, nb);
-            nb_left -= (int32_t)nb;
-            state = (base | bits_val) & M_MASK;
+            // ── Coord j2 ──────────────────────────────────────────────
+            {
+                int j = j2;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
 
-            int32_t w_int = (int32_t)sym - w_offset;
-            int32_t c_low = (parity == 0u)
-                ? ((int32_t)pat_j << 1)
-                : ((pat_j != 0u) ? -1 : 1);
-            int32_t v_int = c_low + 4 * w_int;
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
 
-            float w_val = beta_val * (float)v_int + offset_val;
-            float a_f32 = __bfloat162float(a_act[k_base + j]);
-            partial += w_val * a_f32;
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+
+                float w_val = beta_val * (float)v_int + offset_val;
+                partial += w_val * a_f32_lo;
+            }
+
+            // ── Coord j2+1 ────────────────────────────────────────────
+            {
+                int j = j2 + 1;
+                uint32_t pat_j = pat_row[j];
+                uint32_t cb = (parity << 1) | pat_j;
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                nb_left -= (int32_t)nb;
+                state = (base | bits_val) & M_MASK;
+
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+
+                float w_val = beta_val * (float)v_int + offset_val;
+                partial += w_val * a_f32_hi;
+            }
         }
 
         acc_val[slot] += partial;
@@ -625,64 +659,136 @@ __global__ void leech_q24_gemv_bf16_timed_kernel(
         // brackets per coord, blowing up per-stage cycle counts in ways that
         // are hard to reason about. The compiler may still partially unroll;
         // we accept that for measurement purposes.
-        for (int j = 0; j < COORDS_PER_BLOCK; ++j) {
-            // ── Stage 1: pat_row[j] load ────────────────────────────────
-            uint64_t t1_pre = clock64();
-            uint32_t pat_j = pat_row[j];
-            detail::clk_barrier_u32(pat_j);
-            uint64_t t1_post = clock64();
-            cyc[1] += t1_post - t1_pre;
-
-            uint32_t cb = (parity << 1) | pat_j;
-
-            // ── Stage 2: c_decode_tables[cb * M_TABLE + state] lookup ──
-            uint64_t t2_pre = clock64();
-            uint32_t entry = c_decode_tables[cb * M_TABLE + state];
-            detail::clk_barrier_u32(entry);
-            uint64_t t2_post = clock64();
-            cyc[2] += t2_post - t2_pre;
-
-            uint32_t sym  = entry & 0xFFu;
-            uint32_t nb   = (entry >> 8) & 0xFFu;
-            uint32_t base = entry >> 16;
-
-            // ── Stage 3: extract_nb_bits_from_window (Path A batch read) ─
-            uint64_t t3_pre = clock64();
-            uint32_t bits_val = extract_nb_bits_from_window(
-                tile_bitstream, bit_off, nb_left, nb);
-            detail::clk_barrier_u32(bits_val);
-            uint64_t t3_post = clock64();
-            cyc[3] += t3_post - t3_pre;
-
-            nb_left -= (int32_t)nb;
-
-            // ── Stage 4: state = (base | bits_val) & M_MASK ─────────────
-            uint64_t t4_pre = clock64();
-            state = (base | bits_val) & M_MASK;
-            detail::clk_barrier_u32(state);
-            uint64_t t4_post = clock64();
-            cyc[4] += t4_post - t4_pre;
-
-            int32_t w_int = (int32_t)sym - w_offset;
-            int32_t c_low = (parity == 0u)
-                ? ((int32_t)pat_j << 1)
-                : ((pat_j != 0u) ? -1 : 1);
-            int32_t v_int = c_low + 4 * w_int;
-            float w_val = beta_val * (float)v_int + offset_val;
-
-            // ── Stage 5: a_act load + bf16→f32 cast ─────────────────────
+        //
+        // bf16x2-vectorized variant: outer loop runs 12 pair-iterations. The
+        // stage 5 bracket covers ONE __nv_bfloat162 load + two casts per pair
+        // (vs one bf16 load + one cast per coord in the scalar form). The
+        // test code divides cyc[5] by `blocks*24` (per-coord-equivalent), so
+        // the reported number is the per-coord-equivalent cost of the paired
+        // load — directly comparable to the pre-vectorize stage 5 number.
+        for (int j2 = 0; j2 < COORDS_PER_BLOCK; j2 += 2) {
+            // ── Stage 5 (pair): a_act bf16x2 load + 2× bf16→f32 cast ────
             uint64_t t5_pre = clock64();
-            float a_f32 = __bfloat162float(a_act[k_base + j]);
-            detail::clk_barrier_f32(a_f32);
+            __nv_bfloat162 a_pair = *reinterpret_cast<const __nv_bfloat162*>(
+                &a_act[k_base + j2]);
+            float a_f32_lo = __low2float(a_pair);
+            float a_f32_hi = __high2float(a_pair);
+            detail::clk_barrier_f32(a_f32_lo);
+            detail::clk_barrier_f32(a_f32_hi);
             uint64_t t5_post = clock64();
             cyc[5] += t5_post - t5_pre;
 
-            // ── Stage 6: FMA partial += w_val * a_f32 ───────────────────
-            uint64_t t6_pre = clock64();
-            partial += w_val * a_f32;
-            detail::clk_barrier_f32(partial);
-            uint64_t t6_post = clock64();
-            cyc[6] += t6_post - t6_pre;
+            // ── Coord j2 ──────────────────────────────────────────────
+            {
+                int j = j2;
+
+                // ── Stage 1: pat_row[j] load ────────────────────────────
+                uint64_t t1_pre = clock64();
+                uint32_t pat_j = pat_row[j];
+                detail::clk_barrier_u32(pat_j);
+                uint64_t t1_post = clock64();
+                cyc[1] += t1_post - t1_pre;
+
+                uint32_t cb = (parity << 1) | pat_j;
+
+                // ── Stage 2: c_decode_tables lookup ────────────────────
+                uint64_t t2_pre = clock64();
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                detail::clk_barrier_u32(entry);
+                uint64_t t2_post = clock64();
+                cyc[2] += t2_post - t2_pre;
+
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+
+                // ── Stage 3: extract_nb_bits_from_window ───────────────
+                uint64_t t3_pre = clock64();
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                detail::clk_barrier_u32(bits_val);
+                uint64_t t3_post = clock64();
+                cyc[3] += t3_post - t3_pre;
+
+                nb_left -= (int32_t)nb;
+
+                // ── Stage 4: state update ──────────────────────────────
+                uint64_t t4_pre = clock64();
+                state = (base | bits_val) & M_MASK;
+                detail::clk_barrier_u32(state);
+                uint64_t t4_post = clock64();
+                cyc[4] += t4_post - t4_pre;
+
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+
+                // ── Stage 6: FMA ───────────────────────────────────────
+                uint64_t t6_pre = clock64();
+                partial += w_val * a_f32_lo;
+                detail::clk_barrier_f32(partial);
+                uint64_t t6_post = clock64();
+                cyc[6] += t6_post - t6_pre;
+            }
+
+            // ── Coord j2+1 ────────────────────────────────────────────
+            {
+                int j = j2 + 1;
+
+                // ── Stage 1: pat_row[j] load ────────────────────────────
+                uint64_t t1_pre = clock64();
+                uint32_t pat_j = pat_row[j];
+                detail::clk_barrier_u32(pat_j);
+                uint64_t t1_post = clock64();
+                cyc[1] += t1_post - t1_pre;
+
+                uint32_t cb = (parity << 1) | pat_j;
+
+                // ── Stage 2: c_decode_tables lookup ────────────────────
+                uint64_t t2_pre = clock64();
+                uint32_t entry = c_decode_tables[cb * M_TABLE + state];
+                detail::clk_barrier_u32(entry);
+                uint64_t t2_post = clock64();
+                cyc[2] += t2_post - t2_pre;
+
+                uint32_t sym  = entry & 0xFFu;
+                uint32_t nb   = (entry >> 8) & 0xFFu;
+                uint32_t base = entry >> 16;
+
+                // ── Stage 3: extract_nb_bits_from_window ───────────────
+                uint64_t t3_pre = clock64();
+                uint32_t bits_val = extract_nb_bits_from_window(
+                    tile_bitstream, bit_off, nb_left, nb);
+                detail::clk_barrier_u32(bits_val);
+                uint64_t t3_post = clock64();
+                cyc[3] += t3_post - t3_pre;
+
+                nb_left -= (int32_t)nb;
+
+                // ── Stage 4: state update ──────────────────────────────
+                uint64_t t4_pre = clock64();
+                state = (base | bits_val) & M_MASK;
+                detail::clk_barrier_u32(state);
+                uint64_t t4_post = clock64();
+                cyc[4] += t4_post - t4_pre;
+
+                int32_t w_int = (int32_t)sym - w_offset;
+                int32_t c_low = (parity == 0u)
+                    ? ((int32_t)pat_j << 1)
+                    : ((pat_j != 0u) ? -1 : 1);
+                int32_t v_int = c_low + 4 * w_int;
+                float w_val = beta_val * (float)v_int + offset_val;
+
+                // ── Stage 6: FMA ───────────────────────────────────────
+                uint64_t t6_pre = clock64();
+                partial += w_val * a_f32_hi;
+                detail::clk_barrier_f32(partial);
+                uint64_t t6_post = clock64();
+                cyc[6] += t6_post - t6_pre;
+            }
         }
 
         acc_val[slot] += partial;
