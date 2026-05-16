@@ -104,8 +104,9 @@ fn decode_v_int_matches_cpu_reference() {
     };
 
     // Upload to device.
+    use candle_core::backend::BackendDevice;
     use candle_core::cuda::cudarc::driver::DevicePtr;
-    use candle_core::{Device, Storage};
+    use candle_core::Device;
     let device = Device::new_cuda(0).expect("Device::Cuda");
     let cuda = device.as_cuda_device().expect("cuda device");
 
@@ -141,7 +142,7 @@ fn decode_v_int_matches_cpu_reference() {
     cuda.memcpy_htod(&bit_offsets, &mut d_offs).expect("htod offs");
 
     let out_elems = (n_blocks as usize) * 24;
-    let mut d_out = unsafe { cuda.alloc::<i8>(out_elems).expect("alloc out") };
+    let d_out = unsafe { cuda.alloc::<i8>(out_elems).expect("alloc out") };
 
     // Launch.
     let (packed_ptr, _) = d_packed.device_ptr(d_packed.stream());
