@@ -683,19 +683,26 @@ __global__ void leech_q24_gemv_bf16_v4_kernel(
 
     const uint32_t warp_lane = threadIdx.x & 31u;
     const uint32_t tile_lane0 = warp_lane - k;
-    // Mask of the K lanes belonging to this tile (K consecutive lanes
-    // starting at tile_lane0). K divides 32, so this fits in 32 bits.
+    // ── Warp-shuffle synchronisation note ────────────────────────────
+    // CUDA requires every lane named in a `__shfl_*_sync` mask to be
+    // currently executing the same instruction AND to pass the SAME mask
+    // value. The "obvious" mask `((1u << K) - 1u) << tile_lane0` is
+    // DIFFERENT for each of the (32/K) sub-groups within a warp — that
+    // would be UB (and produces silent-corruption at K∈{4,8,16,32} on
+    // Blackwell sm_120).
     //
-    // CAREFUL: at K=32, `(1u << K) - 1u` is `1u << 32`, which is UB in C++
-    // (and on Blackwell PTX usually evaluates to 0 because the shift count is
-    // taken mod 32). Special-case K=32 to a full-warp 0xFFFFFFFFu mask.
-    const uint32_t mask = (K == 32)
-        ? 0xFFFFFFFFu
-        : (((1u << K) - 1u) << tile_lane0);
+    // Workaround: pass `0xFFFFFFFFu` (all 32 lanes) to every shuffle, and
+    // let the xor_off / src-lane arithmetic restrict the actual data
+    // movement to within each K-subgroup. The K-subgroup always spans K
+    // consecutive lanes starting at a multiple of K, so any `lane ^ xor_off`
+    // with `xor_off < K` stays inside the subgroup; same for the
+    // `__shfl_sync` broadcast from `tile_lane0` since `tile_lane0` is the
+    // base of the lane's own subgroup.
+    constexpr uint32_t MASK_ALL = 0xFFFFFFFFu;
 
     // Step 1: lane k=0 owns the canonical (row_a, row_b) for the tile.
-    uint32_t row_a = __shfl_sync(mask, acc_row[0], tile_lane0);
-    uint32_t row_b = __shfl_sync(mask, acc_row[1], tile_lane0);
+    uint32_t row_a = __shfl_sync(MASK_ALL, acc_row[0], tile_lane0);
+    uint32_t row_b = __shfl_sync(MASK_ALL, acc_row[1], tile_lane0);
 
     // Step 2: re-key our own (row, val) pairs into (val_a, val_b).
     float val_a = 0.0f, val_b = 0.0f;
@@ -711,8 +718,8 @@ __global__ void leech_q24_gemv_bf16_v4_kernel(
     // Step 3: butterfly-xor reduce across K lanes.
     #pragma unroll
     for (int xor_off = K / 2; xor_off > 0; xor_off >>= 1) {
-        val_a += __shfl_xor_sync(mask, val_a, xor_off);
-        val_b += __shfl_xor_sync(mask, val_b, xor_off);
+        val_a += __shfl_xor_sync(MASK_ALL, val_a, xor_off);
+        val_b += __shfl_xor_sync(MASK_ALL, val_b, xor_off);
     }
 
     // Step 4: lane k=0 issues atomicAdds.
